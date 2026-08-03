@@ -4,7 +4,7 @@ import readline from "node:readline/promises"
 import { stdin, stdout } from "node:process"
 
 import * as api from "../src/api.js"
-import { claudeVersion, loginProfile } from "../src/claude.js"
+import { claudeAdvice, claudeVersion, loginProfile, resolveClaude } from "../src/claude.js"
 import { readConfig, writeConfig, serverUrl, deviceToken } from "../src/config.js"
 import { addProfile, listProfiles, removeProfile, scanProfiles } from "../src/profiles.js"
 import { start } from "../src/runner.js"
@@ -69,10 +69,16 @@ async function cmdPair(args) {
 
   const version = await claudeVersion()
   if (!version) {
-    console.error("Claude Code isn't installed, or isn't on PATH.")
-    console.error("Install it and sign in first — that's the login this machine will spend.")
+    // One message for one cause. This used to say "isn't installed, or isn't
+    // on PATH" and then advise installing it — which is the wrong remedy for
+    // the more common half of that sentence, and sends someone to reinstall
+    // software they already have.
+    console.error(claudeAdvice() || "Claude Code isn't usable on this machine.")
     return 1
   }
+
+  const advice = claudeAdvice()
+  if (advice) console.error(advice)
 
   const code = args.code || (await ask(`Pairing code from ${serverUrl()}/devices/setup: `))
   if (!code) {
@@ -129,7 +135,14 @@ async function cmdStatus() {
   console.log(`cma-agent ${VERSION}`)
   console.log(`Server:      ${serverUrl()}`)
   console.log(`Paired:      ${deviceToken() ? `yes (${config.device_id || "unknown id"})` : "no — run `cma-agent pair`"}`)
-  console.log(`Claude Code: ${version || "not found on PATH"}`)
+  // Where it resolved from, not just whether it answered. "not found on PATH"
+  // was actively misleading when it was sitting in ~/.local/bin the whole time.
+  const { bin, source } = resolveClaude()
+  console.log(`Claude Code: ${version || "not found"}`)
+  console.log(`             ${bin ? `${bin}  (${source})` : "no claude binary found"}`)
+
+  const advice = claudeAdvice()
+  if (advice) console.log(`\n${advice}`)
 
   const profiles = await scanProfiles()
   printProfiles(profiles)
