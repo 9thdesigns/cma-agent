@@ -1,5 +1,114 @@
 import { spawn } from "node:child_process"
+import { accessSync, constants } from "node:fs"
+import { homedir } from "node:os"
+import path from "node:path"
 import { profileDir } from "./config.js"
+
+// ---------------------------------------------------------------------------
+// Finding Claude Code.
+//
+// Spawning the bare name "claude" and letting PATH sort it out fails in two
+// situations that are both normal rather than exotic:
+//
+//   1. claude.ai/install.sh puts the binary in ~/.local/bin, which is not on a
+//      default macOS PATH. The installer prints the line to add it, and a user
+//      who hasn't run that line yet has Claude Code installed and working while
+//      we report it missing.
+//
+//   2. `cma-agent start` is meant to run unattended. A process launched by
+//      launchd or systemd gets a minimal PATH and never reads a login shell's
+//      profile, so ~/.local/bin is invisible to it no matter what the user's
+//      terminal does. That one cannot be fixed by telling anyone to edit
+//      .zshrc — the service and the shell do not share a PATH.
+//
+// So look it up ourselves, keep the absolute path, and spawn that.
+// ---------------------------------------------------------------------------
+
+// Relative to the home directory, most likely first. ~/.local/bin is where the
+// official installer lands; the rest cover npm/bun globals and older builds.
+const HOME_LOCATIONS = [
+  ".local/bin/claude",
+  ".claude/local/claude",
+  ".bun/bin/claude",
+  ".npm-global/bin/claude",
+  ".volta/bin/claude"
+]
+
+const SYSTEM_LOCATIONS = [
+  "/opt/homebrew/bin/claude",
+  "/usr/local/bin/claude",
+  "/usr/bin/claude"
+]
+
+function isExecutable(file) {
+  try {
+    accessSync(file, constants.X_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function searchPath() {
+  const entries = (process.env.PATH || "").split(path.delimiter).filter(Boolean)
+  for (const dir of entries) {
+    const candidate = path.join(dir, "claude")
+    if (isExecutable(candidate)) return candidate
+  }
+  return null
+}
+
+function searchKnownLocations() {
+  const home = homedir()
+  const candidates = [
+    ...HOME_LOCATIONS.map((rel) => path.join(home, rel)),
+    ...SYSTEM_LOCATIONS
+  ]
+  return candidates.find(isExecutable) || null
+}
+
+let resolved
+
+// { bin, source } — source is why we picked it, which is the difference
+// between "install Claude Code" and "your PATH is missing a directory".
+export function resolveClaude({ refresh = false } = {}) {
+  if (resolved && !refresh) return resolved
+
+  const override = process.env.CMA_CLAUDE_BIN
+  if (override) {
+    resolved = { bin: override, source: "CMA_CLAUDE_BIN" }
+    return resolved
+  }
+
+  const onPath = searchPath()
+  if (onPath) {
+    resolved = { bin: onPath, source: "PATH" }
+    return resolved
+  }
+
+  const known = searchKnownLocations()
+  resolved = known ? { bin: known, source: "known-location" } : { bin: null, source: "missing" }
+  return resolved
+}
+
+// One line of advice matched to what we actually found, or null when there is
+// nothing worth saying. Callers print this instead of guessing.
+export function claudeAdvice() {
+  const { bin, source } = resolveClaude()
+
+  if (source === "missing") {
+    return "Claude Code isn't installed. Install it from https://claude.com/product/claude-code and sign in — " +
+           "that's the login this machine will spend."
+  }
+
+  if (source === "known-location") {
+    const dir = path.dirname(bin)
+    return `Found Claude Code at ${bin}, but ${dir} isn't on your PATH. Using it anyway. ` +
+           `To fix your shell too:\n    echo 'export PATH="${dir}:$PATH"' >> ~/.zshrc && source ~/.zshrc`
+  }
+
+  return null
+}
 
 // ---------------------------------------------------------------------------
 // The Claude Code CLI surface we depend on.
@@ -10,7 +119,9 @@ import { profileDir } from "./config.js"
 // installed build with `claude --help` before changing anything here.
 // ---------------------------------------------------------------------------
 const CLI = {
-  bin: process.env.CMA_CLAUDE_BIN || "claude",
+  // Resolved, absolute, and looked up once — see resolveClaude above for why a
+  // bare "claude" is not good enough.
+  get bin() { return resolveClaude().bin || "claude" },
   print: "-p",
   outputFormat: ["--output-format", "json"],
   model: (id) => ["--model", id],

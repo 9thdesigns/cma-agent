@@ -1,7 +1,7 @@
 import os from "node:os"
 
 import * as api from "./api.js"
-import { claudeVersion, runCompletion } from "./claude.js"
+import { claudeAdvice, claudeVersion, runCompletion } from "./claude.js"
 import { scanProfiles, resolveSlug, RUNTIME } from "./profiles.js"
 import { VERSION } from "./version.js"
 
@@ -19,9 +19,15 @@ const BACKOFF_MAX_MS = 30000
 export async function start({ log = console.log } = {}) {
   const claudeVer = await claudeVersion()
   if (!claudeVer) {
-    log("! Claude Code isn't installed, or isn't on PATH. Install it and sign in, then start again.")
+    log(`! ${claudeAdvice() || "Claude Code isn't usable on this machine."}`)
     return 1
   }
+
+  // Say it even on success: a service started by launchd will be running the
+  // copy we resolved, not whatever the user's terminal finds, and the two
+  // disagreeing is worth seeing in the log before it causes confusion.
+  const advice = claudeAdvice()
+  if (advice) log(`  ${advice}`)
 
   log(`cma-agent ${VERSION} · Claude Code ${claudeVer}`)
   log(`Host: ${os.hostname()}`)
@@ -60,7 +66,7 @@ export async function start({ log = console.log } = {}) {
   const heartbeatTimer = setInterval(beat, HEARTBEAT_MS)
   const rescanTimer = setInterval(rescan, RESCAN_MS)
 
-  log("Waiting for work. Leave this running (or install the background service with `cma-agent install-service`).")
+  log("Waiting for work. Leave this running.")
 
   let backoff = BACKOFF_START_MS
 

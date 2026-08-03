@@ -16,18 +16,23 @@ no secret on the server side to leak.
 
 ## Install
 
-There is no published package yet — no npm release, no Homebrew tap. Install
-from a checkout:
-
 ```sh
-git clone https://github.com/9thdesigns/configure-my-ai.git
-npm install -g ./configure-my-ai/agent
+brew install 9thdesigns/tap/cma-agent
 ```
 
-Requires Node 20+, and [Claude Code](https://claude.com/product/claude-code)
+Or, without Homebrew — npm installs the git URL directly, so this is still one
+line:
+
+```sh
+npm install -g https://github.com/9thdesigns/cma-agent
+```
+
+Homebrew pulls Node in as a dependency; npm assumes you already have Node 20+.
+Either way you also need [Claude Code](https://claude.com/product/claude-code)
 installed and signed in.
 
-To uninstall: `npm uninstall -g @configuremyai/cma-agent`.
+To uninstall: `brew uninstall cma-agent`, or
+`npm uninstall -g @configuremyai/cma-agent`.
 
 ### Publishing
 
@@ -129,7 +134,7 @@ Connections are outbound only. Nothing listens, no ports open, no firewall rules
 | `CMA_SERVER_URL` | Point at a different host (default `https://configuremyai.com`) |
 | `CMA_DEVICE_TOKEN` | Supply the device token directly instead of `config.json` |
 | `CMA_AGENT_HOME` | Where state lives (default `~/.configure-my-ai`) |
-| `CMA_CLAUDE_BIN` | Path to the `claude` binary if it isn't on `PATH` |
+| `CMA_CLAUDE_BIN` | Path to the `claude` binary. Only needed for a non-standard install — `~/.local/bin`, Homebrew and the npm/bun globals are found automatically, on `PATH` or not |
 | `CMA_RUN_TIMEOUT_MS` | Per-run ceiling (default 150000) |
 
 ## Keeping it awake
