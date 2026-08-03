@@ -61,6 +61,12 @@ export function heartbeat({ agentVersion, claudeCodeVersion }) {
   }).then((r) => r.data)
 }
 
+// What the server believes about this machine. Read-only, so `status` can
+// report the truth rather than the companion's own optimism.
+export function status() {
+  return request("/api/agent/v1/status").then((r) => r.data)
+}
+
 export function syncProfiles(profiles) {
   return request("/api/agent/v1/profiles", {
     method: "PUT",

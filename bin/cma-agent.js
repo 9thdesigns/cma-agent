@@ -128,25 +128,123 @@ async function cmdVerify() {
   }
 }
 
+// Both halves of the picture, and one clear next step.
+//
+// This used to report only what the machine could see locally, which is the
+// half that is almost never wrong. Every confusing state — paired but offline,
+// signed in but not reported, reported but no provider created — lives in the
+// gap between the machine and the server, and showing one side made that gap
+// invisible. Now it asks.
 async function cmdStatus() {
   const config = readConfig()
   const version = await claudeVersion()
+  const { bin, source } = resolveClaude()
+  const next = []
 
   console.log(`cma-agent ${VERSION}`)
   console.log(`Server:      ${serverUrl()}`)
-  console.log(`Paired:      ${deviceToken() ? `yes (${config.device_id || "unknown id"})` : "no — run `cma-agent pair`"}`)
-  // Where it resolved from, not just whether it answered. "not found on PATH"
-  // was actively misleading when it was sitting in ~/.local/bin the whole time.
-  const { bin, source } = resolveClaude()
-  console.log(`Claude Code: ${version || "not found"}`)
-  console.log(`             ${bin ? `${bin}  (${source})` : "no claude binary found"}`)
+
+  console.log("\nOn this machine")
+  console.log(`  Claude Code:  ${version || "not found"}`)
+  if (bin) console.log(`                ${bin}  (${source})`)
+  if (!version) next.push("Install Claude Code and sign in: https://claude.com/product/claude-code")
 
   const advice = claudeAdvice()
-  if (advice) console.log(`\n${advice}`)
+  if (advice && version) console.log(`                ${advice.split("\n")[0]}`)
 
-  const profiles = await scanProfiles()
-  printProfiles(profiles)
+  const local = await scanProfiles()
+  printProfiles(local, "  ")
+  if (version && !local.some((p) => p.status === "ready")) {
+    next.push('Sign a login in: cma-agent claude:add --label "Work"')
+  }
+
+  console.log("\nConfigure My AI")
+  if (!deviceToken()) {
+    console.log("  Paired:       no")
+    next.push("Pair this machine: cma-agent pair")
+    printNext(next)
+    return 0
+  }
+
+  console.log(`  Paired:       yes (${config.device_id || "unknown id"})`)
+
+  let remote
+  try {
+    remote = await api.status()
+  } catch (error) {
+    // Say which failure it was. "Couldn't reach the server" and "the server
+    // doesn't recognise this machine" need opposite responses.
+    if (error.status === 401) {
+      console.log("  Session:      this machine is no longer paired")
+      next.push("Pair again: cma-agent pair")
+    } else if (error.status === 409) {
+      console.log("  Session:      lapsed after two weeks of silence")
+      next.push("Restore it: cma-agent verify")
+    } else {
+      console.log(`  Session:      couldn't ask — ${error.message}`)
+      next.push(`Check ${serverUrl()} is reachable from this machine`)
+    }
+    printNext(next)
+    return 1
+  }
+
+  const device = remote.device || {}
+  const credentials = remote.credentials || []
+  const knownProfiles = device.profiles || []
+
+  console.log(`  Known as:     ${device.name || "?"}`)
+  console.log(`  Seen:         ${device.online ? "connected now" : `offline${device.last_seen_at ? ` — last seen ${ago(device.last_seen_at)}` : ""}`}`)
+  if (device.session_expires_at) {
+    console.log(`  Session:      runs to ${new Date(device.session_expires_at).toLocaleString()}`)
+  }
+
+  if (knownProfiles.length === 0) {
+    console.log("  Logins there: none reported yet")
+  } else {
+    console.log("  Logins there:")
+    for (const p of knownProfiles) {
+      const state = p.status === "ready" ? "" : `  — ${String(p.status).replace("_", " ")}`
+      console.log(`    ${p.status === "ready" ? "✓" : "✗"} ${p.label}  [${p.slug}]${state}`)
+    }
+  }
+
+  console.log(`  Providers:    ${credentials.length === 0 ? "none created yet" : credentials.map((c) => c.name).join(", ")}`)
+
+  // The comparison is the point. Each of these is a state the two sides can
+  // reach independently, and none of them is visible from one side alone.
+  const localReady = local.filter((p) => p.status === "ready")
+  const remoteReady = knownProfiles.filter((p) => p.status === "ready")
+
+  if (localReady.length > 0 && remoteReady.length === 0) {
+    next.push("This machine has a working login Configure My AI hasn't been told about: cma-agent claude:scan")
+  } else if (remoteReady.length > 0 && credentials.length === 0) {
+    next.push("A login is reported but no provider exists — run `cma-agent claude:scan` to trigger it again")
+  }
+
+  if (!device.online) {
+    next.push("Nothing runs until the companion is listening: cma-agent start")
+  }
+
+  printNext(next)
   return 0
+}
+
+function printNext(steps) {
+  if (steps.length === 0) {
+    console.log("\n✓ Connected and ready. Work sent to this machine will run here.")
+    return
+  }
+  console.log("\nNext:")
+  for (const step of steps) console.log(`  → ${step}`)
+}
+
+function ago(iso) {
+  const seconds = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000))
+  if (seconds < 90) return `${seconds}s ago`
+  const minutes = Math.round(seconds / 60)
+  if (minutes < 90) return `${minutes} min ago`
+  const hours = Math.round(minutes / 60)
+  return hours < 48 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`
 }
 
 async function cmdClaudeAdd(args) {
@@ -168,9 +266,28 @@ async function cmdClaudeAdd(args) {
   console.log("This is Anthropic's own sign-in. Configure My AI never sees it.\n")
 
   await loginProfile(profile.slug)
-  await reportProfiles()
 
-  console.log(`\n✓ "${profile.label}" is ready. Pick it on an Anthropic provider in the web app.`)
+  // Confirm against what we can actually see, rather than assuming the sign-in
+  // took. Claude Code keeps credentials in the macOS Keychain, so a per-profile
+  // CLAUDE_CONFIG_DIR does not always isolate them the way it does on Linux —
+  // "you signed in" and "this profile resolves" are genuinely different claims.
+  const scanned = await scanProfiles()
+  const mine = scanned.find((p) => p.slug === profile.slug)
+  const failure = await reportProfiles(scanned)
+
+  if (mine?.status !== "ready") {
+    console.error(`\n✗ "${profile.label}" still isn't signing in (${mine?.status || "not found"}).`)
+    console.error(`  Try again with: cma-agent claude:login --profile ${profile.slug}`)
+    return 1
+  }
+
+  if (failure) {
+    console.error(`\n! "${profile.label}" works on this machine, but Configure My AI wasn't told: ${failure}`)
+    console.error("  Fix that, then run: cma-agent claude:scan")
+    return 1
+  }
+
+  console.log(`\n✓ "${profile.label}" is ready and reported. Pick it on an Anthropic provider in the web app.`)
   return 0
 }
 
@@ -195,8 +312,12 @@ async function cmdClaudeList() {
 async function cmdClaudeScan() {
   const profiles = await scanProfiles()
   printProfiles(profiles)
-  const reported = await reportProfiles(profiles)
-  console.log(reported ? "\n✓ Reported to Configure My AI." : "\n! Couldn't reach Configure My AI — the next heartbeat will carry this.")
+  const failure = await reportProfiles(profiles)
+  if (failure) {
+    console.error(`\n! Not reported: ${failure}`)
+    return 1
+  }
+  console.log("\n✓ Reported to Configure My AI.")
   return 0
 }
 
@@ -219,27 +340,36 @@ async function cmdClaudeRemove(args) {
   return 0
 }
 
+// Returns null on success, or the reason it failed.
+//
+// This used to return a bare false that every caller ignored, so `claude:add`
+// printed "✓ ready" whether or not the login had reached the server. A sync
+// that silently fails and then congratulates you is worse than one that
+// crashes: the web app sits there saying "No Claude logins reported yet" and
+// nothing on the machine disagrees with it.
 async function reportProfiles(profiles) {
   try {
     await api.syncProfiles(profiles || (await scanProfiles()))
-    return true
-  } catch (_error) {
-    return false
+    return null
+  } catch (error) {
+    if (error.status === 401) return "this machine is no longer paired — run `cma-agent pair`"
+    if (error.status === 409) return "this machine's session lapsed — run `cma-agent verify`"
+    return error.message || "couldn't reach Configure My AI"
   }
 }
 
-function printProfiles(profiles) {
+function printProfiles(profiles, indent = "") {
   if (!profiles || profiles.length === 0) {
-    console.log("\nClaude logins: none found.")
+    console.log(indent ? `${indent}Logins here: none found.` : "\nClaude logins: none found.")
     return
   }
 
-  console.log("\nClaude logins:")
+  console.log(indent ? `${indent}Logins here:` : "\nClaude logins:")
   for (const profile of profiles) {
     const mark = profile.status === "ready" ? "✓" : profile.status === "logged_out" ? "✗" : "?"
     const hint = profile.account_hint ? ` (${profile.account_hint})` : ""
     const state = profile.status === "ready" ? "" : `  — ${profile.status.replace("_", " ")}`
-    console.log(`  ${mark} ${profile.label}${hint}  [${profile.slug}]${state}`)
+    console.log(`${indent}  ${mark} ${profile.label}${hint}  [${profile.slug}]${state}`)
   }
 }
 
