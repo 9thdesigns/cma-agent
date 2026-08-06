@@ -176,9 +176,13 @@ async function handleJob(job, log) {
         // watching the web app the same running ticker they would see in a
         // terminal. Errors are swallowed — a heartbeat that fails to post is
         // not a reason to kill a run that is going fine.
-        onProgress: (note) => {
-          log(`  · ${note}`)
-          api.reportProgress(job.id, note).catch(() => {})
+        // `repeat` means this is a liveness beat for something already
+        // reported, not a new action. Still posted — the server is waiting on
+        // it — but not printed, so the terminal shows what happened rather
+        // than how often we said so.
+        onProgress: (note, { repeat } = {}) => {
+          if (!repeat) log(`  · ${note}`)
+          api.reportProgress(job.id, note, { repeat }).catch(() => {})
         }
       }
     )
