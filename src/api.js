@@ -90,6 +90,19 @@ export function claimJob({ wait = 25 } = {}) {
   }).then((r) => r.data?.job || null)
 }
 
+// "Still here." Posted every few seconds while a run is in flight so the
+// server can wait on liveness instead of on a duration it had to guess. Fire
+// and forget by design: a dropped heartbeat costs nothing (the next one lands
+// well inside the server's silence budget), and blocking a run on it would be
+// the tail wagging the dog.
+export function reportProgress(jobId, note) {
+  return request(`/api/agent/v1/jobs/${jobId}/progress`, {
+    method: "POST",
+    body: { note: String(note || "").slice(0, 200) },
+    timeoutMs: 10000
+  }).then((r) => r.data)
+}
+
 export function submitResult(jobId, payload) {
   return request(`/api/agent/v1/jobs/${jobId}/result`, {
     method: "POST",

@@ -7,6 +7,7 @@ import * as api from "../src/api.js"
 import { claudeAdvice, claudeVersion, loginProfile, resolveClaude } from "../src/claude.js"
 import { readConfig, writeConfig, serverUrl, deviceToken } from "../src/config.js"
 import { addProfile, listProfiles, removeProfile, scanProfiles } from "../src/profiles.js"
+import { addRoot, listRoots, removeRoot, reposList } from "../src/repos.js"
 import { start } from "../src/runner.js"
 import { VERSION } from "../src/version.js"
 
@@ -22,6 +23,13 @@ Setup
 
 Running
   start                         Wait for work and run it (leave this running)
+
+Local repositories
+  repos:add ~/code              Share a folder so the web app can see the git
+                                  repositories inside it. Nothing is visible
+                                  until you do this.
+  repos:list                    Show the shared folders and what was found
+  repos:remove ~/code           Stop sharing a folder
 
 Claude logins
   claude:add --label "Work"     Add a separate Claude login and sign into it
@@ -247,6 +255,68 @@ function ago(iso) {
   return hours < 48 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`
 }
 
+// ---------------------------------------------------------------------------
+// Local repositories. Sharing is explicit and per-folder — see src/repos.js
+// for why there is no "just scan my home directory" option.
+// ---------------------------------------------------------------------------
+
+async function cmdReposAdd(args) {
+  const target = args._[0] || args.path
+  if (!target || target === true) {
+    console.error("Which folder? e.g. cma-agent repos:add ~/code")
+    return 1
+  }
+
+  let resolved
+  try {
+    resolved = addRoot(String(target))
+  } catch (error) {
+    console.error(`✗ ${error.message}`)
+    return 1
+  }
+
+  const { repos } = await reposList()
+  const mine = repos.filter((r) => r.path.startsWith(resolved))
+  console.log(`✓ Sharing ${resolved}`)
+  console.log(`  ${mine.length} ${mine.length === 1 ? "repository" : "repositories"} visible to Configure My AI.`)
+  for (const repo of mine.slice(0, 20)) {
+    console.log(`    ${repo.name}  [${repo.branch}]${repo.dirty ? "  · uncommitted changes" : ""}`)
+  }
+  if (mine.length > 20) console.log(`    …and ${mine.length - 20} more`)
+  return 0
+}
+
+async function cmdReposList() {
+  const roots = listRoots()
+  if (roots.length === 0) {
+    console.log("No folders are shared from this machine.")
+    console.log("\nNext:\n  → Share one: cma-agent repos:add ~/code")
+    return 0
+  }
+
+  console.log("Shared folders:")
+  for (const root of roots) console.log(`  ${root}`)
+
+  const { repos } = await reposList()
+  console.log(`\nRepositories (${repos.length}):`)
+  for (const repo of repos) {
+    const slug = repo.github ? `  ${repo.github}` : ""
+    console.log(`  ${repo.name}  [${repo.branch}]${repo.dirty ? "  · dirty" : ""}${slug}`)
+    console.log(`    ${repo.path}`)
+  }
+  return 0
+}
+
+async function cmdReposRemove(args) {
+  const target = args._[0] || args.path
+  if (!target || target === true) {
+    console.error("Which folder? e.g. cma-agent repos:remove ~/code")
+    return 1
+  }
+  console.log(`✓ Stopped sharing ${removeRoot(String(target))}`)
+  return 0
+}
+
 async function cmdClaudeAdd(args) {
   const label = args.label
   if (!label || label === true) {
@@ -383,6 +453,9 @@ async function main() {
     case "start": return start()
     case "verify": return cmdVerify()
     case "status": return cmdStatus()
+    case "repos:add": return cmdReposAdd(args)
+    case "repos:list": return cmdReposList()
+    case "repos:remove": return cmdReposRemove(args)
     case "claude:add": return cmdClaudeAdd(args)
     case "claude:login": return cmdClaudeLogin(args)
     case "claude:list": return cmdClaudeList()
