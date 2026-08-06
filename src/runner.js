@@ -3,6 +3,7 @@ import os from "node:os"
 import * as api from "./api.js"
 import { claudeAdvice, claudeVersion, runCompletion } from "./claude.js"
 import { scanProfiles, resolveSlug, RUNTIME } from "./profiles.js"
+import { resolveRepo, runCommand, COMMANDS } from "./repos.js"
 import { VERSION } from "./version.js"
 
 const HEARTBEAT_MS = 30000
@@ -107,6 +108,27 @@ export async function start({ log = console.log } = {}) {
 async function handleJob(job, log) {
   const started = Date.now()
 
+  // Git and repository questions don't involve Claude at all — they are this
+  // machine answering about itself. Handled first so a runtime mismatch on the
+  // Claude side can't block someone from seeing their own branches.
+  const kind = job.kind || "completion"
+  if (kind in COMMANDS) {
+    log(`→ ${kind}…`)
+    try {
+      const data = await runCommand(kind, job.params || {})
+      await api.submitResult(job.id, { data })
+      log(`✓ ${kind} in ${Math.round((Date.now() - started) / 1000)}s`)
+    } catch (error) {
+      try {
+        await api.submitResult(job.id, { error: error.message })
+      } catch (_reportError) {
+        log(`! Couldn't report the failure for job ${job.id}`)
+      }
+      log(`✗ ${error.message}`)
+    }
+    return
+  }
+
   // The server may know about runtimes this build can't drive. Refusing with a
   // clear reason beats running the job under the wrong CLI, which would spend
   // the wrong subscription.
@@ -121,10 +143,45 @@ async function handleJob(job, log) {
     return
   }
 
-  log(`→ Running ${job.model || "default model"} on "${job.profile_slug || "default"}"…`)
+  // A coding turn against a local repository runs Claude Code *in* that
+  // directory, with its own tools. That is the difference between describing
+  // a change and making one — and it is why this path exists rather than
+  // flattening the repo into a prompt. The path is still validated against the
+  // shared-folder allowlist here; the server asking is not authorization.
+  let workdir = null
+  if (job.workdir) {
+    try {
+      workdir = resolveRepo(job.workdir)
+    } catch (error) {
+      try {
+        await api.submitResult(job.id, { error: error.message })
+      } catch (_reportError) {
+        log(`! Couldn't report the failure for job ${job.id}`)
+      }
+      log(`✗ ${error.message}`)
+      return
+    }
+  }
+
+  log(
+    `→ Running ${job.model || "default model"} on "${job.profile_slug || "default"}"` +
+    `${workdir ? ` in ${workdir}` : ""}…`
+  )
 
   try {
-    const output = await runCompletion({ ...job, profileSlug: resolveSlug(job.profile_slug) })
+    const output = await runCompletion(
+      { ...job, workdir, profileSlug: resolveSlug(job.profile_slug) },
+      {
+        // Two jobs at once: keep the server's wait alive, and give the person
+        // watching the web app the same running ticker they would see in a
+        // terminal. Errors are swallowed — a heartbeat that fails to post is
+        // not a reason to kill a run that is going fine.
+        onProgress: (note) => {
+          log(`  · ${note}`)
+          api.reportProgress(job.id, note).catch(() => {})
+        }
+      }
+    )
 
     await api.submitResult(job.id, {
       content: output.content,
