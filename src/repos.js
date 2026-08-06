@@ -3,7 +3,7 @@ import fs from "node:fs"
 import path from "node:path"
 import os from "node:os"
 
-import { readConfig, writeConfig } from "./config.js"
+import { HOME, readConfig, writeConfig } from "./config.js"
 
 // ---------------------------------------------------------------------------
 // Local repositories.
@@ -38,6 +38,22 @@ const SKIP_DIRS = new Set([
 ])
 
 const GIT_TIMEOUT_MS = 20000
+
+// Checkouts we manage ourselves, for sessions linked to a GitHub repository
+// rather than to a folder the user shared.
+//
+// Implicitly trusted — unlike a shared folder it is created by us, lives inside
+// our own state directory, and holds nothing that wasn't already on GitHub. It
+// is what makes a local session behave like Claude Code on the web: the model
+// gets a real working tree instead of a keyhole view pasted into its prompt.
+export const WORKSPACES_DIR = path.join(HOME, "workspaces")
+
+// Clones use the user's OWN git credentials, via whatever credential helper
+// they already have configured. No GitHub token is ever sent to this machine —
+// same principle as the Claude login, which we also never touch. The cost is
+// that a private repository the user cannot clone by hand cannot be cloned
+// here either, which is the correct failure.
+const CLONE_TIMEOUT_MS = 300000
 
 export function expandHome(input) {
   const raw = String(input || "").trim()
@@ -85,13 +101,6 @@ function withinRoot(target, root) {
 // a symlink inside an allowlisted root that points at ~/.ssh must be judged on
 // where it lands, not on where it sits.
 export function resolveRepo(requested) {
-  const roots = listRoots()
-  if (roots.length === 0) {
-    throw new Error(
-      "No repository folders are shared from this machine. Run `cma-agent repos:add ~/code` to share one."
-    )
-  }
-
   const target = path.resolve(expandHome(requested))
   let real
   try {
@@ -100,7 +109,24 @@ export function resolveRepo(requested) {
     throw new Error(`${target} doesn't exist on this machine.`)
   }
 
-  const allowed = roots.some((root) => {
+  // Our own managed checkouts count as allowed without `repos:add` — we
+  // created them, they live in our state directory, and requiring the user to
+  // share a folder we made ourselves would be theatre rather than consent.
+  const roots = listRoots()
+  let managed = false
+  try {
+    managed = withinRoot(real, fs.realpathSync(WORKSPACES_DIR))
+  } catch {
+    managed = false
+  }
+
+  if (!managed && roots.length === 0) {
+    throw new Error(
+      "No repository folders are shared from this machine. Run `cma-agent repos:add ~/code` to share one."
+    )
+  }
+
+  const allowed = managed || roots.some((root) => {
     try {
       return withinRoot(real, fs.realpathSync(root))
     } catch {
@@ -379,6 +405,74 @@ export async function push(params) {
   }
 }
 
+// Make sure a checkout of `github` exists on this machine and is up to date,
+// and return where it is.
+//
+// This is what closes the gap between a local session and Claude Code on the
+// web. Without it a session linked to a GitHub repository ran with no working
+// directory at all: the model got a truncated file tree pasted into its prompt,
+// no tools pointed at anything, and — following its instructions exactly —
+// asked the user to paste files. With it the model gets the real repository and
+// behaves like Claude Code, because it IS Claude Code.
+export async function ensureCheckout(params) {
+  const slug = sanitizeSlug(params.github)
+  const branch = params.branch ? sanitizeBranch(params.branch) : null
+  const dir = path.join(WORKSPACES_DIR, slug.replace("/", "__"))
+
+  fs.mkdirSync(WORKSPACES_DIR, { recursive: true, mode: 0o700 })
+
+  const fresh = !fs.existsSync(path.join(dir, ".git"))
+  if (fresh) {
+    // --filter=blob:none keeps the full history (so `git log` is honest) while
+    // fetching file contents on demand. A plain clone of a large repository is
+    // minutes the user spends staring at a spinner; a shallow one would make
+    // the history the model reads a lie.
+    const cloned = await git(WORKSPACES_DIR, [
+      "clone", "--filter=blob:none",
+      `https://github.com/${slug}.git`, dir
+    ], { timeoutMs: CLONE_TIMEOUT_MS })
+
+    if (!cloned.ok) {
+      throw new Error(
+        `Couldn't clone ${slug} on this machine: ${cloned.stderr.trim().slice(0, 300)}. ` +
+        "The clone uses your own git credentials — check you can `git clone` it by hand."
+      )
+    }
+  } else {
+    const fetched = await git(dir, ["fetch", "origin", "--prune"], { timeoutMs: CLONE_TIMEOUT_MS })
+    if (!fetched.ok) {
+      throw new Error(`Couldn't update ${slug}: ${fetched.stderr.trim().slice(0, 300)}`)
+    }
+  }
+
+  if (branch) {
+    // Track the remote branch if we don't have it yet; otherwise just move to
+    // it. Deliberately NOT a hard reset: uncommitted work in this checkout is
+    // the user's, even in a directory we created.
+    const exists = (await git(dir, ["rev-parse", "--verify", `refs/heads/${branch}`])).ok
+    const checkout = exists
+      ? await git(dir, ["checkout", branch])
+      : await git(dir, ["checkout", "-B", branch, `origin/${branch}`])
+
+    if (checkout.ok) {
+      await git(dir, ["merge", "--ff-only", `origin/${branch}`])
+    }
+    // A failed checkout is not fatal — the default branch is still a usable
+    // working tree, and saying so beats refusing to run at all.
+  }
+
+  return { ...(await describe(dir)), created: fresh, managed: true }
+}
+
+// owner/repo, and nothing that could be read as a flag or a path.
+function sanitizeSlug(input) {
+  const slug = String(input || "").trim()
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(slug) || slug.includes("..") || slug.startsWith("-")) {
+    throw new Error(`"${input}" isn't a usable owner/repo.`)
+  }
+  return slug
+}
+
 // git accepts a lot as a ref name; we accept much less. Anything outside this
 // set is a typo or an attempt, and neither should reach a command line.
 function sanitizeBranch(input) {
@@ -394,6 +488,7 @@ function sanitizeBranch(input) {
 // clear "update cma-agent" instead of silence.
 export const COMMANDS = {
   "repos.list": reposList,
+  "repo.ensure": ensureCheckout,
   "git.summary": summary,
   "git.log": log,
   "git.diff": diff,

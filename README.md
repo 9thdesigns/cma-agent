@@ -129,6 +129,7 @@ What the server can then ask for, and nothing else:
 | Request | What this machine does |
 | --- | --- |
 | `repos.list` | Lists git repositories inside shared folders (2 levels deep) |
+| `repo.ensure` | Clones/updates a checkout of a linked GitHub repo under `~/.configure-my-ai/workspaces` |
 | `git.summary` | Branch, working-tree status, last 20 commits, branch list |
 | `git.log` | Commit history |
 | `git.diff` | The working diff |
@@ -138,6 +139,24 @@ Every one of those resolves its path against the shared-folder list and refuses
 anything outside it — symlinks resolved, `..` rejected. The server asking is a
 request, not permission. `git` is invoked with an argument array, never a shell
 string, so a hostile branch name is a bad branch name rather than a command.
+
+### Checkouts we make ourselves
+
+A session linked to a **GitHub** repository rather than to a folder you shared
+gets a checkout under `~/.configure-my-ai/workspaces/<owner>__<repo>`, made on
+demand by `repo.ensure`. That directory is usable without `repos:add` — we
+created it, it lives in our own state directory, and asking you to share a
+folder we made ourselves would be theatre rather than consent. Everything
+outside it still needs sharing.
+
+The clone uses **your own git credentials**, via whatever helper you already
+have configured. No GitHub token is ever sent to this machine — the same
+principle as your Claude login. A private repository you cannot `git clone` by
+hand cannot be cloned here either, which is the correct failure.
+
+Clones are `--filter=blob:none`: full history, so `git log` tells the truth,
+with file contents fetched on demand so a large repository doesn't cost minutes
+before the first answer.
 
 The pull request itself is opened by the web app using your GitHub
 authorization; this machine only pushes, using whatever git credentials you
@@ -152,11 +171,13 @@ directory and no elevated mode.
 
 1. The web app queues a prompt for this machine.
 2. `cma-agent start` is long-polling, and claims it.
-3. It runs `claude -p --output-format stream-json --verbose` under the chosen
-   profile — in the linked repository's directory, if the job has one.
-4. As events arrive it posts a heartbeat every ~10s saying what it is doing.
+3. It runs `claude -p --output-format stream-json --verbose
+   --include-partial-messages` under the chosen profile — in the linked
+   repository's directory, if the job has one.
+4. It posts a heartbeat every ~10s **on a timer**, carrying what it is doing.
    The web app shows that as a live ticker, and it is what tells the server the
-   run is alive.
+   run is alive. On a timer rather than on events, because a `Bash` tool running
+   a test suite produces no events for minutes while being entirely alive.
 5. The answer and token counts go back; the queued copy is deleted.
 
 Connections are outbound only. Nothing listens, no ports open, no firewall rules.
@@ -200,7 +221,7 @@ distinguish a long run from a dead one — buffering emits nothing until the end
 | `CMA_DEVICE_TOKEN` | Supply the device token directly instead of `config.json` |
 | `CMA_AGENT_HOME` | Where state lives (default `~/.configure-my-ai`) |
 | `CMA_CLAUDE_BIN` | Path to the `claude` binary. Only needed for a non-standard install — `~/.local/bin`, Homebrew and the npm/bun globals are found automatically, on `PATH` or not |
-| `CMA_IDLE_TIMEOUT_MS` | How long a run may produce **no output** before it is stopped (default 120000). This is a silence budget, not a duration budget — a run that keeps streaming never hits it, however long it takes |
+| `CMA_IDLE_TIMEOUT_MS` | How long a run may produce **no output** before it is stopped (default 600000 — 10 min, which clears the longest single Bash tool call). This is a silence budget, not a duration budget — a run that keeps streaming never hits it, however long it takes |
 | `CMA_MAX_RUN_MS` | Backstop for a wedged process that is somehow still emitting (default 4 h). Not a budget for real work |
 
 ## Keeping it awake

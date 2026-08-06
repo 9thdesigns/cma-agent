@@ -124,10 +124,21 @@ const CLI = {
   get bin() { return resolveClaude().bin || "claude" },
   print: "-p",
   outputFormat: ["--output-format", "json"],
-  // Turn-by-turn NDJSON. `--verbose` is not optional here: without it
-  // stream-json does not emit the per-turn events, which are the entire point.
+  // Turn-by-turn NDJSON.
+  //
+  // `--verbose` is not optional: without it stream-json does not emit the
+  // per-turn events, which are the entire point.
+  //
+  // `--include-partial-messages` is not optional either, and leaving it off was
+  // a real bug. Plain stream-json emits one event per COMPLETED message, so a
+  // model thinking hard, or generating a large tool input, is silent on the
+  // wire for as long as that takes — which our idle timer read as a dead
+  // process and killed mid-edit. Partial messages give token-level deltas, so
+  // "no output" finally means what the timer assumes it means.
   // Verified against the CLI reference for Claude Code 2.1.220.
-  streamFormat: ["--output-format", "stream-json", "--verbose"],
+  streamFormat: [
+    "--output-format", "stream-json", "--verbose", "--include-partial-messages"
+  ],
   model: (id) => ["--model", id],
   appendSystem: (text) => ["--append-system-prompt", text],
   // Working inside a real repository means Claude Code must be allowed to
@@ -158,20 +169,32 @@ const CLI = {
 // not duration. MAX_RUN_MS exists only to reap a wedged process that is
 // somehow still emitting; it is deliberately far beyond any real run.
 // ---------------------------------------------------------------------------
-const IDLE_TIMEOUT_MS = Number(process.env.CMA_IDLE_TIMEOUT_MS || 120000)
+// 120s was too tight even with partial messages, and the reason is tool
+// execution rather than generation. While a Bash tool runs the project's test
+// suite, Claude Code emits nothing at all — there is no token to stream — and
+// its own Bash timeout allows up to ten minutes. So the silence budget has to
+// clear the longest single tool call, or we kill healthy runs again, just
+// later. Ten minutes of genuine silence really is stuck.
+//
+// This does not delay noticing a slept machine: the heartbeat below is on a
+// timer, so the SERVER stops hearing from us within seconds of the process
+// dying, whatever this value is.
+const IDLE_TIMEOUT_MS = Number(process.env.CMA_IDLE_TIMEOUT_MS || 600000)
 const MAX_RUN_MS = Number(process.env.CMA_MAX_RUN_MS || 4 * 60 * 60 * 1000)
 const PROBE_TIMEOUT_MS = 20000
 
 // A progress post does two jobs, and they want different rates.
 //
-// As a heartbeat it only has to beat the server's silence budget, so every
-// 10s is plenty and one dropped post costs nothing. As a ticker it is what
-// someone is reading, and "Starting up" left on screen for ten seconds while
-// the model is already three files in is a worse lie than no ticker at all.
+// As a heartbeat it only has to beat the server's silence budget, so every 10s
+// is plenty and one dropped post costs nothing. Crucially it fires on a TIMER,
+// not on events: during a long tool call there are no events, and a run that
+// only heartbeats when the model speaks would be reaped by the server halfway
+// through its own test suite.
 //
-// So: post the moment the note CHANGES (rate-limited to once a second so a
-// burst of tool calls can't flood the endpoint), and post regardless every
-// 10s to keep the run's liveness fresh.
+// As a ticker it is what someone is reading, and "Starting up" left on screen
+// while the model is already three files in is a worse lie than no ticker.
+// So it also posts the moment the note CHANGES, rate-limited to once a second
+// so a burst of tool calls can't flood the endpoint.
 const MIN_NOTE_INTERVAL_MS = 1000
 const HEARTBEAT_EVERY_MS = 10000
 
@@ -217,7 +240,7 @@ function run(args, { env = {}, timeoutMs = IDLE_TIMEOUT_MS, input, cwd } = {}) {
 // Resolves with every event we saw plus how the process ended. The idle clock
 // resets on ANY byte from either pipe — a tool running for three minutes is
 // silent on stdout but the run is plainly alive, so stderr counts too.
-function runStreaming(args, { env = {}, cwd, onEvent } = {}) {
+function runStreaming(args, { env = {}, cwd, onEvent, onTick } = {}) {
   return new Promise((resolve) => {
     const child = spawn(CLI.bin, args, {
       env: { ...process.env, ...env },
@@ -245,8 +268,15 @@ function runStreaming(args, { env = {}, cwd, onEvent } = {}) {
       }
     }, 1000)
 
+    // Independent of events, and that is the point: while a Bash tool runs the
+    // project's test suite there are no events for minutes, but the run is
+    // plainly alive and the server has to keep hearing so.
+    const heartbeat = onTick ? setInterval(() => { try { onTick() } catch { /* ignore */ } },
+                                           HEARTBEAT_EVERY_MS) : null
+
     const finish = (code, spawnError) => {
       clearInterval(watchdog)
+      if (heartbeat) clearInterval(heartbeat)
       resolve({
         code,
         events,
@@ -434,6 +464,39 @@ function baseArgs(job) {
   return args
 }
 
+// Last two path segments — right for a file, wrong for everything else.
+//
+// The previous version applied this to every tool input including Bash
+// commands, which turned `cd ~/proj && git log --oneline -5 | head -20` into
+// "Running proj && git log --oneline -5 | head -" and `2>/dev/null` into
+// "Running dev/null". Splitting a shell command on "/" was never going to
+// produce a sentence.
+function shortPath(value) {
+  const raw = String(value || "").trim().replace(/\/+$/, "")
+  if (!raw) return ""
+  return raw.split("/").filter(Boolean).slice(-2).join("/").slice(0, 48)
+}
+
+// A command, made readable.
+//
+// Claude Code's Bash tool carries a human `description` alongside the command.
+// When it is there it beats anything we could derive AND it is already a
+// sentence — "Run the test suite" — so the caller uses it verbatim rather than
+// prefixing "Running" onto it.
+function describedCommand(input) {
+  return String(input.description || "").trim().slice(0, 60)
+}
+
+function shortCommand(input) {
+  let cmd = String(input.command || "").trim()
+  if (!cmd) return ""
+  // A leading `cd somewhere &&` is scaffolding, not the point of the command.
+  cmd = cmd.replace(/^cd\s+[^&;|]+(&&|;)\s*/, "")
+  // Collapse newlines and runs of spaces so a heredoc doesn't become a wall.
+  cmd = cmd.replace(/\s+/g, " ").trim()
+  return cmd.length > 60 ? `${cmd.slice(0, 57)}…` : cmd
+}
+
 // One short human line per event, for the "Reading foo.rb" ticker the web app
 // shows while a run is in flight. Mirrors Code::Agent#humanize_step on the
 // server so both paths read the same to a user.
@@ -448,18 +511,52 @@ function describeEvent(event) {
     for (const block of blocks) {
       if (block?.type !== "tool_use") continue
       const input = block.input || {}
-      const target = input.file_path || input.path || input.pattern || input.command || input.url || ""
-      const short = String(target).split("/").slice(-2).join("/").slice(0, 60)
+      const file = shortPath(input.file_path || input.notebook_path || input.path)
+
       switch (block.name) {
-        case "Read":      return short ? `Reading ${short}` : "Reading a file"
+        case "Read":         return file ? `Reading ${file}` : "Reading a file"
         case "Edit":
-        case "MultiEdit": return short ? `Editing ${short}` : "Editing a file"
-        case "Write":     return short ? `Writing ${short}` : "Writing a file"
-        case "Bash":      return short ? `Running ${short}` : "Running a command"
-        case "Grep":      return short ? `Searching ${short}` : "Searching"
-        case "Glob":      return short ? `Looking for ${short}` : "Looking for files"
-        case "WebFetch":  return short ? `Reading ${short}` : "Reading a page"
-        default:          return `${block.name}${short ? ` ${short}` : ""}`.slice(0, 80)
+        case "MultiEdit":    return file ? `Editing ${file}` : "Editing a file"
+        case "Write":        return file ? `Writing ${file}` : "Writing a file"
+        case "NotebookEdit": return file ? `Editing ${file}` : "Editing a notebook"
+        case "Bash": {
+          const described = describedCommand(input)
+          if (described) return described
+          const cmd = shortCommand(input)
+          return cmd ? `Running ${cmd}` : "Running a command"
+        }
+        case "BashOutput":   return "Checking a running command"
+        case "Grep": {
+          const pattern = String(input.pattern || "").trim().slice(0, 40)
+          return pattern ? `Searching for ${pattern}` : "Searching the code"
+        }
+        case "Glob": {
+          const pattern = String(input.pattern || "").trim().slice(0, 40)
+          return pattern ? `Looking for ${pattern}` : "Looking for files"
+        }
+        case "WebFetch":
+        case "WebSearch": {
+          let host = ""
+          try { host = new URL(String(input.url || "")).host } catch { host = "" }
+          return host ? `Reading ${host}` : "Searching the web"
+        }
+        // Planning and bookkeeping tools. Their arguments are internal state
+        // and mean nothing to someone watching, so they get a verb and no noun.
+        case "TodoWrite":
+        case "TaskCreate":
+        case "TaskUpdate":   return "Updating the plan"
+        case "Task":         return "Delegating a subtask"
+        case "ToolSearch":   return "Looking up a tool"
+        case "ExitPlanMode": return "Finishing the plan"
+        default: {
+          // MCP tools arrive as mcp__server__tool; the middle part is the
+          // only half worth showing.
+          const name = String(block.name || "")
+          const pretty = name.startsWith("mcp__")
+            ? name.split("__").slice(1).join(" ").replace(/_/g, " ")
+            : name.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase()
+          return pretty ? `${pretty.charAt(0).toUpperCase()}${pretty.slice(1)}`.slice(0, 60) : "Working"
+        }
       }
     }
     return "Thinking"
@@ -533,24 +630,33 @@ export async function runCompletion(job, { onProgress } = {}) {
   let lastNote = null   // the newest thing we know it is doing
   let postedNote = null // the newest thing we have told the server
   let lastPost = 0
+
+  // `repeat` distinguishes the two reasons we post. A note the server has
+  // already seen is liveness only and must not be appended to the visible
+  // trace again — that is what turned the ticker into "Reading foo.rb" six
+  // times in a row when the model was doing one thing slowly.
+  const post = (repeat) => {
+    if (!onProgress) return
+    lastPost = Date.now()
+    postedNote = lastNote
+    onProgress(lastNote || "Working", { repeat })
+  }
+
   const result = await runStreaming(
     [CLI.print, ...CLI.streamFormat, ...baseArgs(job), prompt],
     {
       env,
       cwd: job.workdir,
+      // Timer-driven: keeps the run alive in the server's eyes even when the
+      // model has been silent for minutes inside a single tool call.
+      onTick: () => { if (Date.now() - lastPost >= HEARTBEAT_EVERY_MS) post(true) },
       onEvent: (event) => {
         const note = describeEvent(event)
         if (note) lastNote = note
         if (!onProgress) return
 
-        const now = Date.now()
-        const since = now - lastPost
         const changed = lastNote !== null && lastNote !== postedNote
-        if (!(changed && since >= MIN_NOTE_INTERVAL_MS) && since < HEARTBEAT_EVERY_MS) return
-
-        lastPost = now
-        postedNote = lastNote
-        onProgress(lastNote || "Working")
+        if (changed && Date.now() - lastPost >= MIN_NOTE_INTERVAL_MS) post(false)
       }
     }
   )
