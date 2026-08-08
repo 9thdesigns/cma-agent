@@ -405,6 +405,70 @@ export async function push(params) {
   }
 }
 
+// The remote's default branch as this checkout knows it (origin/HEAD), or
+// null when the clone never learned one. Used as a guardrail, so null means
+// "can't prove it's safe" is decided by the caller, not silently allowed.
+async function defaultBranch(cwd) {
+  const out = await git(cwd, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
+  if (out.ok) return out.stdout.trim().replace(/^refs\/remotes\/origin\//, "")
+  return null
+}
+
+// Branches these commands must never touch: the repository default branch,
+// the session's base branch (sent by the server), and whatever is checked
+// out right now. Deleting or renaming any of them strands the session or the
+// user's working tree.
+async function assertBranchOperable(cwd, name, base) {
+  const def = await defaultBranch(cwd)
+  if (def && name === def) {
+    throw new Error(`Refusing to touch ${name}: it is the repository default branch.`)
+  }
+  if (base && name === base) {
+    throw new Error(`Refusing to touch ${name}: it is this session's base branch.`)
+  }
+  const current = await currentBranch(cwd)
+  if (name === current) {
+    throw new Error(`Refusing to touch ${name}: it is currently checked out.`)
+  }
+}
+
+// Rename a LOCAL branch. Deliberately never touches the remote — publishing
+// is `git.push`'s job and stays on the session's working branch only.
+export async function branchRename(params) {
+  const cwd = resolveRepo(params.path)
+  const from = sanitizeBranch(params.from)
+  const to = sanitizeBranch(params.to)
+  const base = params.base ? sanitizeBranch(params.base) : null
+
+  await assertBranchOperable(cwd, from, base)
+  const def = await defaultBranch(cwd)
+  if ((def && to === def) || (base && to === base)) {
+    throw new Error(`Refusing to rename onto ${to}: it is a protected branch name.`)
+  }
+
+  const out = await git(cwd, ["branch", "-m", from, to])
+  if (!out.ok) {
+    throw new Error(`Couldn't rename ${from} to ${to}: ${out.stderr.trim().slice(0, 300)}`)
+  }
+  return { renamed: true, from, to, local_only: true }
+}
+
+// Delete a LOCAL branch. -D to match the server-side ref delete semantics;
+// the guardrails above are what make that acceptable.
+export async function branchDelete(params) {
+  const cwd = resolveRepo(params.path)
+  const name = sanitizeBranch(params.branch || params.name)
+  const base = params.base ? sanitizeBranch(params.base) : null
+
+  await assertBranchOperable(cwd, name, base)
+
+  const out = await git(cwd, ["branch", "-D", name])
+  if (!out.ok) {
+    throw new Error(`Couldn't delete ${name}: ${out.stderr.trim().slice(0, 300)}`)
+  }
+  return { deleted: true, branch: name, local_only: true }
+}
+
 // Make sure a checkout of `github` exists on this machine and is up to date,
 // and return where it is.
 //
@@ -492,7 +556,9 @@ export const COMMANDS = {
   "git.summary": summary,
   "git.log": log,
   "git.diff": diff,
-  "git.push": push
+  "git.push": push,
+  "git.branch.rename": branchRename,
+  "git.branch.delete": branchDelete
 }
 
 export async function runCommand(kind, params = {}) {

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process"
 import { accessSync, constants } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
+import { fileURLToPath } from "node:url"
 import { profileDir } from "./config.js"
 
 // ---------------------------------------------------------------------------
@@ -146,7 +147,93 @@ const CLI = {
   // answer in. `acceptEdits` is the narrow choice on purpose: edits yes,
   // arbitrary commands no. The directory it is confined to has already been
   // allowlisted by the user via `cma-agent repos:add`.
-  permissionMode: (mode) => ["--permission-mode", mode]
+  permissionMode: (mode) => ["--permission-mode", mode],
+  allowedTools: (list) => ["--allowedTools", list.join(",")],
+  disallowedTools: (list) => ["--disallowedTools", list.join(",")],
+  mcpConfig: (json) => ["--mcp-config", json]
+}
+
+// ---------------------------------------------------------------------------
+// What a repository turn is allowed to do.
+//
+// `acceptEdits` on its own is edits and nothing else: every `git` invocation
+// came back "This command requires approval", and a headless run has no
+// terminal for anyone to approve in. So a session could rewrite the working
+// tree and then had to ask the user to commit and push it by hand — which is
+// the same dead end as "press the button", one layer down.
+//
+// The fix is not `bypassPermissions`. That would hand a coding turn the whole
+// machine, and the boundary this companion is built around is that the user
+// shares a folder and gets work done inside it, not that they hand over their
+// laptop. So the allowance is enumerated: read and edit files, drive git, and
+// call the GitHub operations tools. Everything else still stops and asks —
+// which in a headless run means it doesn't happen.
+// ---------------------------------------------------------------------------
+const FILE_TOOLS = ["Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "LS", "TodoWrite"]
+
+// Prefix-matched by Claude Code: `Bash(git commit:*)` covers any git commit
+// invocation and nothing else. Read-only inspection first, then the mutations
+// a turn genuinely needs to ship its work.
+const GIT_TOOLS = [
+  "status", "diff", "log", "show", "branch", "remote", "rev-parse", "ls-files", "describe",
+  "add", "commit", "checkout", "switch", "restore", "stash", "fetch", "pull", "merge",
+  "rebase", "push", "tag", "cherry-pick"
+].map((verb) => `Bash(git ${verb}:*)`)
+
+// Deny beats allow. These are the git commands that destroy work rather than
+// producing it — a force-push discards someone else's commits, `reset --hard`
+// and `clean -fd` discard the user's. None of them is ever the only way to
+// finish a task, so a turn that wants one can say so instead.
+const FORBIDDEN_TOOLS = [
+  "Bash(git push --force:*)",
+  "Bash(git push -f:*)",
+  "Bash(git push --force-with-lease:*)",
+  "Bash(git reset --hard:*)",
+  "Bash(git clean:*)",
+  "Bash(git filter-branch:*)"
+]
+
+// The MCP server carrying this app's GitHub connection. Named as a whole, so
+// an operation added on the server side needs no companion release to be
+// callable.
+const GITHUB_MCP_SERVER = "cma_github"
+
+function allowedToolsFor(job) {
+  const tools = []
+  if (job.workdir) tools.push(...FILE_TOOLS, ...GIT_TOOLS)
+  if (job.github?.token) tools.push(`mcp__${GITHUB_MCP_SERVER}`)
+  return tools
+}
+
+// Inline JSON rather than a temp file, and no `env` block: the token would
+// otherwise sit on disk or in a config the model could read back. Claude Code
+// inherits our environment, so the server process picks it up from there —
+// see envForGithub.
+function mcpConfigFor() {
+  return JSON.stringify({
+    mcpServers: {
+      [GITHUB_MCP_SERVER]: { command: process.execPath, args: [selfPath(), "mcp-github"] }
+    }
+  })
+}
+
+// Our own entry point, resolved from this module rather than from argv, so it
+// is right whether we were started as `cma-agent`, as `node bin/cma-agent.js`,
+// or by a service manager with a different cwd.
+function selfPath() {
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "cma-agent.js")
+}
+
+// Endpoint and token for the GitHub operations MCP server, passed by
+// environment. Never an argument (arguments are visible in `ps`) and never a
+// file (files outlive the run).
+function envForGithub(job) {
+  if (!job.github?.token) return {}
+
+  return {
+    CMA_GITHUB_ENDPOINT: String(job.github.endpoint || ""),
+    CMA_GITHUB_TOKEN: String(job.github.token)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +327,13 @@ function run(args, { env = {}, timeoutMs = IDLE_TIMEOUT_MS, input, cwd } = {}) {
 // Resolves with every event we saw plus how the process ended. The idle clock
 // resets on ANY byte from either pipe — a tool running for three minutes is
 // silent on stdout but the run is plainly alive, so stderr counts too.
-function runStreaming(args, { env = {}, cwd, onEvent, onTick } = {}) {
+//
+// `control`, when given, is handed a `kill()` the caller may invoke to end
+// the run deliberately (the server said the job was cancelled). SIGKILL, not
+// SIGTERM: mid-tool-call Claude Code can linger on a polite signal, and a
+// cancelled run has nothing worth a graceful exit. The result carries
+// `killed: true` so the caller can tell "we stopped it" from "it died".
+function runStreaming(args, { env = {}, cwd, onEvent, onTick, control } = {}) {
   return new Promise((resolve) => {
     const child = spawn(CLI.bin, args, {
       env: { ...process.env, ...env },
@@ -255,7 +348,15 @@ function runStreaming(args, { env = {}, cwd, onEvent, onTick } = {}) {
     let stderr = ""
     let idleOut = false
     let overran = false
+    let killed = false
     let badLines = 0
+
+    if (control) {
+      control.kill = () => {
+        killed = true
+        child.kill("SIGKILL")
+      }
+    }
 
     const watchdog = setInterval(() => {
       const now = Date.now()
@@ -284,6 +385,7 @@ function runStreaming(args, { env = {}, cwd, onEvent, onTick } = {}) {
         badLines,
         idleOut,
         overran,
+        killed,
         spawnError,
         elapsedMs: Date.now() - startedAt
       })
@@ -453,7 +555,10 @@ function firstKey(object) {
   return keys.length > 0 ? keys[0] : null
 }
 
-function baseArgs(job) {
+// Exported so the argument list a repository turn actually runs with can be
+// asserted, rather than trusted. What is allowed here is a security decision;
+// it should not be reachable only through a spawned process.
+export function baseArgs(job) {
   const args = []
   if (job.model) args.push(...CLI.model(job.model))
   if (job.system) args.push(...CLI.appendSystem(job.system))
@@ -461,6 +566,19 @@ function baseArgs(job) {
   // gets no working directory and no elevated permission mode, so nothing
   // about this widens the ordinary path.
   if (job.workdir) args.push(...CLI.permissionMode("acceptEdits"))
+
+  // The GitHub tools are offered whenever the server sent credentials for
+  // them, with or without a checkout: a session with no working tree still
+  // can't push code, but it can open, edit, comment on and merge pull
+  // requests, and being unable to do that was the original complaint.
+  if (job.github?.token) args.push(...CLI.mcpConfig(mcpConfigFor()))
+
+  const allowed = allowedToolsFor(job)
+  if (allowed.length > 0) {
+    args.push(...CLI.allowedTools(allowed))
+    args.push(...CLI.disallowedTools(FORBIDDEN_TOOLS))
+  }
+
   return args
 }
 
@@ -622,24 +740,37 @@ function looksUnsupported(stderr) {
 
 export async function runCompletion(job, { onProgress } = {}) {
   const prompt = renderPrompt(job.messages || [])
-  const env = envForProfile(job.profileSlug)
+  const env = { ...envForProfile(job.profileSlug), ...envForGithub(job) }
 
   // ── Streaming first. This is the path that makes a long run survivable:
   // events arrive continuously, so we can distinguish "still working" from
   // "stopped responding" instead of guessing a duration.
-  let lastNote = null   // the newest thing we know it is doing
-  let postedNote = null // the newest thing we have told the server
+  let lastNote = null      // the newest thing we know it is doing
+  let postedNote = null    // the newest thing we have told the server
   let lastPost = 0
+  let partialText = ""     // every answer token seen so far, in order
+  let postedPartial = ""   // how much of it the server has been sent
+
+  // Filled in by runStreaming with a kill() for the running child. Passed to
+  // the caller on every progress post so it can stop the run the moment the
+  // server answers a heartbeat with "this job was cancelled".
+  const control = {}
+  const cancel = () => { try { control.kill?.() } catch { /* already gone */ } }
 
   // `repeat` distinguishes the two reasons we post. A note the server has
   // already seen is liveness only and must not be appended to the visible
   // trace again — that is what turned the ticker into "Reading foo.rb" six
   // times in a row when the model was doing one thing slowly.
+  //
+  // `partial` rides along on every post — heartbeats included, since the
+  // answer keeps growing while the note stands still. Null when there is no
+  // text yet, so a run that never streams posts exactly what it always did.
   const post = (repeat) => {
     if (!onProgress) return
     lastPost = Date.now()
     postedNote = lastNote
-    onProgress(lastNote || "Working", { repeat })
+    postedPartial = partialText
+    onProgress(lastNote || "Working", { repeat, partial: partialText || null, cancel })
   }
 
   const result = await runStreaming(
@@ -647,16 +778,36 @@ export async function runCompletion(job, { onProgress } = {}) {
     {
       env,
       cwd: job.workdir,
+      control,
       // Timer-driven: keeps the run alive in the server's eyes even when the
       // model has been silent for minutes inside a single tool call.
       onTick: () => { if (Date.now() - lastPost >= HEARTBEAT_EVERY_MS) post(true) },
       onEvent: (event) => {
+        // Token-level deltas from --include-partial-messages. Only top-level
+        // text_deltas are the answer: thinking_delta is private scratchwork,
+        // input_json_delta is tool arguments, and anything carrying a
+        // parent_tool_use_id belongs to a subagent's side conversation.
+        if (event?.type === "stream_event" && !event.parent_tool_use_id) {
+          const delta = event.event?.delta
+          if (delta?.type === "text_delta" && typeof delta.text === "string") {
+            partialText += delta.text
+          }
+        }
+
         const note = describeEvent(event)
         if (note) lastNote = note
         if (!onProgress) return
 
         const changed = lastNote !== null && lastNote !== postedNote
-        if (changed && Date.now() - lastPost >= MIN_NOTE_INTERVAL_MS) post(false)
+        if (changed && Date.now() - lastPost >= MIN_NOTE_INTERVAL_MS) {
+          post(false)
+        } else if (partialText !== postedPartial && Date.now() - lastPost >= MIN_NOTE_INTERVAL_MS) {
+          // Fresh answer text under an unchanged note. Posted as a repeat so
+          // the ticker doesn't grow a duplicate line, at the same once-a-second
+          // ceiling notes get — that cadence is what makes a local run stream
+          // in the web app instead of arriving whole at the end.
+          post(true)
+        }
       }
     }
   )
@@ -669,6 +820,13 @@ export async function runCompletion(job, { onProgress } = {}) {
   // doesn't take these flags. Fall back rather than fail.
   if (result.events.length === 0 && result.code !== 0 && looksUnsupported(result.stderr)) {
     return runBuffered(job, prompt, env)
+  }
+
+  // Deliberate stop, not a failure of the machine. The server has already
+  // marked the job cancelled — reporting is a courtesy for its logs, and an
+  // older server just acks a result for a finished job and moves on.
+  if (result.killed) {
+    throw new Error("The run was cancelled from the web app.")
   }
 
   if (result.idleOut) {
