@@ -6,6 +6,7 @@ import { stdin, stdout } from "node:process"
 import * as api from "../src/api.js"
 import { claudeAdvice, claudeVersion, loginProfile, resolveClaude } from "../src/claude.js"
 import { readConfig, writeConfig, serverUrl, deviceToken } from "../src/config.js"
+import { serve as serveGithubMcp } from "../src/mcp.js"
 import { addProfile, listProfiles, removeProfile, scanProfiles } from "../src/profiles.js"
 import { addRoot, listRoots, removeRoot, reposList } from "../src/repos.js"
 import { start } from "../src/runner.js"
@@ -461,6 +462,11 @@ async function main() {
     case "claude:list": return cmdClaudeList()
     case "claude:scan": return cmdClaudeScan()
     case "claude:remove": return cmdClaudeRemove(args)
+    // Not for people. Claude Code spawns this as an MCP server for a repository
+    // turn, talking JSON-RPC over stdio; its credentials arrive in the
+    // environment. Undocumented in HELP because typing it by hand does nothing
+    // useful — it would sit waiting on stdin.
+    case "mcp-github": return serveGithubMcp()
     case "--version":
     case "version": console.log(VERSION); return 0
     default:

@@ -95,13 +95,22 @@ export function claimJob({ wait = 25 } = {}) {
 // and forget by design: a dropped heartbeat costs nothing (the next one lands
 // well inside the server's silence budget), and blocking a run on it would be
 // the tail wagging the dog.
-export function reportProgress(jobId, note, { repeat = false } = {}) {
+export function reportProgress(jobId, note, { repeat = false, partial = null } = {}) {
+  // `repeat` tells the server this is liveness for an action it already
+  // knows about, so it refreshes the clock without adding another identical
+  // line to what the user is reading.
+  const body = { note: String(note || "").slice(0, 200), repeat }
+
+  // The assistant text so far, when the run has streamed any — this is what
+  // the web app renders live instead of waiting for the finish. Only added
+  // when present, so an older server (or a note-only beat) sees exactly the
+  // payload it always did. Bounded to match the server's own cap on what it
+  // will keep in a queue row.
+  if (partial) body.partial = String(partial).slice(0, 200000)
+
   return request(`/api/agent/v1/jobs/${jobId}/progress`, {
     method: "POST",
-    // `repeat` tells the server this is liveness for an action it already
-    // knows about, so it refreshes the clock without adding another identical
-    // line to what the user is reading.
-    body: { note: String(note || "").slice(0, 200), repeat },
+    body,
     timeoutMs: 10000
   }).then((r) => r.data)
 }

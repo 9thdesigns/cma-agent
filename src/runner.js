@@ -180,9 +180,21 @@ async function handleJob(job, log) {
         // reported, not a new action. Still posted — the server is waiting on
         // it — but not printed, so the terminal shows what happened rather
         // than how often we said so.
-        onProgress: (note, { repeat } = {}) => {
+        // `partial` is the answer so far; it rides every post so the web app
+        // can stream a local run. `cancel` SIGKILLs the running CLI — invoked
+        // only when the server's ack says the job is cancelled, i.e. the
+        // person pressed Stop and the answer is unwanted. An older server
+        // never says so, and this build just runs to completion as before.
+        onProgress: (note, { repeat, partial, cancel } = {}) => {
           if (!repeat) log(`  · ${note}`)
-          api.reportProgress(job.id, note, { repeat }).catch(() => {})
+          api.reportProgress(job.id, note, { repeat, partial })
+            .then((data) => {
+              if (data?.state === "cancelled" && cancel) {
+                log("  · Cancelled from the web app — stopping Claude Code.")
+                cancel()
+              }
+            })
+            .catch(() => {})
         }
       }
     )
