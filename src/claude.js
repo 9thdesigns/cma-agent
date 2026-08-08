@@ -148,9 +148,44 @@ const CLI = {
   // arbitrary commands no. The directory it is confined to has already been
   // allowlisted by the user via `cma-agent repos:add`.
   permissionMode: (mode) => ["--permission-mode", mode],
-  allowedTools: (list) => ["--allowedTools", list.join(",")],
-  disallowedTools: (list) => ["--disallowedTools", list.join(",")],
+  // VARIADIC, both of them, and one tool per argument — the form Claude Code's
+  // own reference shows (`--allowedTools "Bash(git log:*)" "Read"`).
+  //
+  // These were comma-joined into a single token at first, which assumed the
+  // CLI splits on commas. It might; nothing proves it, and if it doesn't the
+  // allowance silently matches nothing and every git call goes back to
+  // "requires approval". The list form needs no such assumption — and we know
+  // for certain these options are variadic, because one of them ate the prompt
+  // and killed 0.5.0 outright.
+  //
+  // Which is also the rule that must not be forgotten: NEVER put a bare
+  // positional after these. The prompt goes in on stdin (see below) precisely
+  // so there is no positional left to swallow.
+  allowedTools: (list) => ["--allowedTools", ...list],
+  disallowedTools: (list) => ["--disallowedTools", ...list],
   mcpConfig: (json) => ["--mcp-config", json]
+}
+
+// The prompt is fed on stdin, never as an argument.
+//
+// Claude Code accepts it either way and the argument form read more simply, so
+// that is what this used to do. It is not safe: any variadic option in the arg
+// list will consume a trailing positional, and adding one is a normal thing to
+// want to do (we added two). Feeding stdin removes the ordering hazard for
+// good, and it sidesteps ARG_MAX for a long conversation as a bonus.
+//
+// Both spawn helpers take `input` and both close stdin immediately after, so a
+// build that never reads it is not left waiting on a pipe.
+
+// The full argv for a streaming run and for the buffered fallback. Exported so
+// the shape can be asserted without spawning anything — see
+// test/permissions.test.js, which checks that neither ends in a positional.
+export function streamingArgs(job) {
+  return [CLI.print, ...CLI.streamFormat, ...baseArgs(job)]
+}
+
+export function bufferedArgs(job) {
+  return [CLI.print, ...CLI.outputFormat, ...baseArgs(job)]
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +320,22 @@ const PROBE_TIMEOUT_MS = 20000
 const MIN_NOTE_INTERVAL_MS = 1000
 const HEARTBEAT_EVERY_MS = 10000
 
+// Feed the prompt and close the pipe, without ever taking the process down.
+//
+// A failed spawn (Claude Code moved, PATH changed under a service) still hands
+// back a child whose stdin errors on write. Unhandled, that EPIPE is an
+// uncaught exception in the companion — a crashed daemon instead of one failed
+// job. The spawn error handler that follows is what reports the real cause.
+function feedStdin(child, input) {
+  try {
+    child.stdin.on("error", () => {})
+    if (input !== undefined) child.stdin.write(input)
+    child.stdin.end()
+  } catch {
+    // Nothing to do: the 'error' event on the child carries the real reason.
+  }
+}
+
 function run(args, { env = {}, timeoutMs = IDLE_TIMEOUT_MS, input, cwd } = {}) {
   return new Promise((resolve) => {
     const child = spawn(CLI.bin, args, {
@@ -315,10 +366,7 @@ function run(args, { env = {}, timeoutMs = IDLE_TIMEOUT_MS, input, cwd } = {}) {
       resolve({ code, stdout, stderr, timedOut })
     })
 
-    if (input !== undefined) {
-      child.stdin.write(input)
-    }
-    child.stdin.end()
+    feedStdin(child, input)
   })
 }
 
@@ -333,13 +381,18 @@ function run(args, { env = {}, timeoutMs = IDLE_TIMEOUT_MS, input, cwd } = {}) {
 // SIGTERM: mid-tool-call Claude Code can linger on a polite signal, and a
 // cancelled run has nothing worth a graceful exit. The result carries
 // `killed: true` so the caller can tell "we stopped it" from "it died".
-function runStreaming(args, { env = {}, cwd, onEvent, onTick, control } = {}) {
+function runStreaming(args, { env = {}, cwd, input, onEvent, onTick, control } = {}) {
   return new Promise((resolve) => {
     const child = spawn(CLI.bin, args, {
       env: { ...process.env, ...env },
       cwd: cwd || undefined,
       stdio: ["pipe", "pipe", "pipe"]
     })
+
+    // The prompt goes in on stdin — see the note above CLI.allowedTools for why
+    // it is not an argument. Closed immediately either way: with stdin left
+    // open, a build that reads from it waits forever for input never coming.
+    feedStdin(child, input)
 
     const events = []
     const startedAt = Date.now()
@@ -738,6 +791,34 @@ function looksUnsupported(stderr) {
     .test(String(stderr || ""))
 }
 
+// The flags that buy capability rather than correctness. If a build rejects one
+// of these, the right outcome is a turn that runs with less — the model edits
+// files and says it cannot ship — not a turn that dies. Losing the whole run to
+// a flag we added is the failure mode this codebase has already produced twice.
+const CAPABILITY_FLAGS = new Set(["--mcp-config", "--allowedTools", "--disallowedTools", "--permission-mode"])
+
+function rejectedCapabilityFlag(stderr) {
+  const text = String(stderr || "")
+  if (!looksUnsupported(text)) return null
+
+  for (const flag of CAPABILITY_FLAGS) {
+    if (text.includes(flag)) return flag
+  }
+  return null
+}
+
+// Drop every capability flag and the values that belong to it. The variadic
+// ones own every word up to the next flag; the rest own exactly one.
+// Exported so the degraded argv can be asserted rather than assumed.
+export function withoutCapabilityFlags(args) {
+  const out = []
+  for (let i = 0; i < args.length; i++) {
+    if (!CAPABILITY_FLAGS.has(args[i])) { out.push(args[i]); continue }
+    while (i + 1 < args.length && !args[i + 1].startsWith("-")) i++
+  }
+  return out
+}
+
 export async function runCompletion(job, { onProgress } = {}) {
   const prompt = renderPrompt(job.messages || [])
   const env = { ...envForProfile(job.profileSlug), ...envForGithub(job) }
@@ -774,10 +855,11 @@ export async function runCompletion(job, { onProgress } = {}) {
   }
 
   const result = await runStreaming(
-    [CLI.print, ...CLI.streamFormat, ...baseArgs(job), prompt],
+    streamingArgs(job),
     {
       env,
       cwd: job.workdir,
+      input: prompt,
       control,
       // Timer-driven: keeps the run alive in the server's eyes even when the
       // model has been silent for minutes inside a single tool call.
@@ -819,6 +901,18 @@ export async function runCompletion(job, { onProgress } = {}) {
   // Nothing parseable and a non-zero exit → almost certainly a build that
   // doesn't take these flags. Fall back rather than fail.
   if (result.events.length === 0 && result.code !== 0 && looksUnsupported(result.stderr)) {
+    const rejected = rejectedCapabilityFlag(result.stderr)
+    if (rejected) {
+      // Say it plainly in the companion's log: the run continues, but without
+      // the tools, so "it edited files and then couldn't push" has a stated
+      // cause instead of looking like the feature is broken again.
+      process.stderr.write(
+        `! This Claude Code build rejected ${rejected}. Retrying without the GitHub tools ` +
+        "and the permission allowance — this turn can edit files but not ship them. " +
+        "Upgrade Claude Code to restore them.\n"
+      )
+      return runBuffered(job, prompt, env, { stripCapabilities: true })
+    }
     return runBuffered(job, prompt, env)
   }
 
@@ -864,9 +958,11 @@ export async function runCompletion(job, { onProgress } = {}) {
 // Code that predates stream-json. It still cannot tell a long run from a dead
 // one — that limitation is inherent to buffering, which is exactly why it is
 // the fallback and not the default.
-async function runBuffered(job, prompt, env) {
-  const result = await run([CLI.print, ...CLI.outputFormat, ...baseArgs(job), prompt], {
+async function runBuffered(job, prompt, env, { stripCapabilities = false } = {}) {
+  const args = stripCapabilities ? withoutCapabilityFlags(bufferedArgs(job)) : bufferedArgs(job)
+  const result = await run(args, {
     env,
+    input: prompt,
     cwd: job.workdir,
     timeoutMs: MAX_RUN_MS
   })
