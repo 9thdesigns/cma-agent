@@ -54,10 +54,20 @@ export function pair({ code, name, platform, agentVersion, profiles }) {
   }).then((r) => r.data)
 }
 
-export function heartbeat({ agentVersion, claudeCodeVersion }) {
+// `runtime_versions` is a map — a machine can hold Claude Code AND Cursor, and
+// the server wants to know which builds it is actually talking to.
+//
+// `claude_code_version` rides along beside it because an older server reads
+// only that column and would otherwise show "unknown" for every machine the
+// moment this companion ships. It is derived, not separately tracked.
+export function heartbeat({ agentVersion, runtimeVersions = {} }) {
   return request("/api/agent/v1/heartbeat", {
     method: "POST",
-    body: { agent_version: agentVersion, claude_code_version: claudeCodeVersion }
+    body: {
+      agent_version: agentVersion,
+      runtime_versions: runtimeVersions,
+      claude_code_version: runtimeVersions.claude_code || null
+    }
   }).then((r) => r.data)
 }
 
@@ -74,10 +84,15 @@ export function syncProfiles(profiles) {
   }).then((r) => r.data)
 }
 
-export function verify({ profiles, agentVersion, claudeCodeVersion }) {
+export function verify({ profiles, agentVersion, runtimeVersions = {} }) {
   return request("/api/agent/v1/verify", {
     method: "POST",
-    body: { profiles, agent_version: agentVersion, claude_code_version: claudeCodeVersion }
+    body: {
+      profiles,
+      agent_version: agentVersion,
+      runtime_versions: runtimeVersions,
+      claude_code_version: runtimeVersions.claude_code || null
+    }
   }).then((r) => r.data)
 }
 

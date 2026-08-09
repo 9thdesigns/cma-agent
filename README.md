@@ -1,18 +1,46 @@
 # cma-agent
 
-Runs Configure My AI work on your own machine, using the Claude Code you already
-installed and signed into — so a configuration can spend your Claude Pro or Max
-plan instead of an API key.
+Runs Configure My AI work on your own machine, using a coding CLI you already
+installed and signed into — so a configuration can spend a subscription you
+already pay for instead of an API key.
+
+## Runtimes
+
+| Runtime | CLI | Plan it spends | Repository turns |
+| --- | --- | --- | --- |
+| Claude Code | `claude` | Claude Pro, Max or Team | Edit files, drive git, open PRs |
+| Cursor | `cursor-agent` | Cursor Pro, Ultra or Teams | Edit files, drive git, open PRs |
+| Gemini CLI | `gemini` | Google AI Pro or Ultra | Edit files only — see below |
+
+Install one or install all three; `cma-agent status` reports what it found and
+what each one can do. A provider in the web app names both the machine and the
+runtime, so a Cursor provider and a Claude Code provider on the same laptop
+spend different subscriptions.
+
+**Cursor billing is not like Claude's.** A Claude Max plan is a rate limit;
+Cursor Pro includes a credit pool that manually-selected frontier models draw
+down, after which usage is billed on demand. Pointing widgets or scheduled bots
+at a Cursor provider can exhaust a month in a way a Claude Max provider cannot.
+
+**What the Gemini CLI runtime cannot do, and why.** A Gemini repository turn
+reads and edits files but is not given a shell, so it cannot run git and the
+GitHub pull-request tools are not offered. Auto-approving shell for Gemini would
+need either `--yolo` (auto-approve *every* action, which is handing over the
+machine) or a Policy Engine file whose format we have not verified. Given the
+choice between over-granting and a stated limitation, this takes the
+limitation — the allowance fails closed. Work still ships: the companion's own
+`git.push` is driven by the server rather than by the model.
 
 ## The one thing to understand
 
-**Your Claude credential never leaves this machine.** The companion doesn't read
-it, store it, or transmit it. Claude Code reads its own login from your OS
-keychain when we spawn it, exactly as it does when you run `claude` yourself.
+**Your vendor credentials never leave this machine.** The companion doesn't read
+them, store them, or transmit them. Each CLI reads its own login from your OS
+keychain or config directory when we spawn it, exactly as it does when you run
+it yourself.
 
 What Configure My AI stores is a routing target: this machine's name, the labels
-you gave your Claude logins, and which one a given provider should use. There is
-no secret on the server side to leak.
+you gave your logins, and which one a given provider should use. There is no
+secret on the server side to leak.
 
 ## Install
 
@@ -28,8 +56,11 @@ npm install -g https://github.com/9thdesigns/cma-agent
 ```
 
 Homebrew pulls Node in as a dependency; npm assumes you already have Node 20+.
-Either way you also need [Claude Code](https://claude.com/product/claude-code)
-installed and signed in.
+Either way you also need at least one of
+[Claude Code](https://claude.com/product/claude-code),
+[Cursor CLI](https://cursor.com/cli) or
+[Gemini CLI](https://github.com/google-gemini/gemini-cli) installed and signed
+in.
 
 To uninstall: `brew uninstall cma-agent`, or
 `npm uninstall -g @configuremyai/cma-agent`.
@@ -81,15 +112,37 @@ cma-agent start     # wait for work
 `cma-agent status` shows pairing state, Claude Code version, and every Claude
 login it can see.
 
-## More than one Claude account
+## More than one account
 
-Each login lives in its own `CLAUDE_CONFIG_DIR`, so a work account and a personal
-account never mix:
+Each login lives in its own config directory (`CLAUDE_CONFIG_DIR` for Claude
+Code, `CURSOR_CONFIG_DIR` for Cursor), so a work account and a personal account
+never mix:
 
 ```sh
-cma-agent claude:add --label "Work" --account you@work.com
-cma-agent claude:add --label "Personal"
+cma-agent runtimes:add --runtime claude_code --label "Work" --account you@work.com
+cma-agent runtimes:add --runtime cursor --label "Personal"
 ```
+
+The old `claude:add`, `claude:login`, `claude:list`, `claude:scan` and
+`claude:remove` still work and still mean Claude Code — they are pinned to it,
+not resolved, so they keep meaning the same thing on a machine that later
+installs Cursor.
+
+`--runtime` can be omitted when only one runtime is installed. With two or more
+it is required rather than guessed, because guessing would sign you into the
+wrong account.
+
+> **Cursor has no ambient login.** Every other runtime can use whatever login
+> you already have with no setup. Cursor cannot, because the file that bounds
+> what a Cursor run may do has to live in a directory we own — writing it into
+> `~/.cursor` would edit the config your editor reads, and writing it into your
+> repository would edit your project. So sign in once with
+> `cma-agent runtimes:login --runtime cursor`, even for the default profile.
+
+> **Gemini keeps one login per machine.** The environment variable that
+> relocates its config directory is not something this build is willing to
+> guess at, so it supports the ambient login only rather than pretending to
+> isolate profiles it cannot.
 
 `--account` is optional and only used to show a masked hint (`y•••@work.com`) so
 you can tell two logins apart in a dropdown. It is not read from Claude Code's
@@ -207,11 +260,12 @@ distinguish a long run from a dead one — buffering emits nothing until the end
 | `repos:add PATH` | Share a folder so the web app can see the repositories in it |
 | `repos:list` | Show shared folders and the repositories found |
 | `repos:remove PATH` | Stop sharing a folder |
-| `claude:add --label X` | Add a separate Claude login and sign into it |
-| `claude:login --profile X` | Sign a login in again after it expires |
-| `claude:list` | Show logins on this machine |
-| `claude:scan` | Re-check every login and report to the web app |
-| `claude:remove --profile X` | Delete a login and its credential from this machine |
+| `runtimes:list` | Show every runtime and the logins on this machine |
+| `runtimes:add --runtime R --label X` | Add a separate login and sign into it |
+| `runtimes:login --runtime R [--profile X]` | Sign a login in again after it expires |
+| `runtimes:scan` | Re-check every login and report to the web app |
+| `runtimes:remove --runtime R --profile X` | Delete a login and its credential from this machine |
+| `claude:*` | The same commands, pinned to Claude Code |
 
 ## Environment
 
@@ -221,6 +275,8 @@ distinguish a long run from a dead one — buffering emits nothing until the end
 | `CMA_DEVICE_TOKEN` | Supply the device token directly instead of `config.json` |
 | `CMA_AGENT_HOME` | Where state lives (default `~/.configure-my-ai`) |
 | `CMA_CLAUDE_BIN` | Path to the `claude` binary. Only needed for a non-standard install — `~/.local/bin`, Homebrew and the npm/bun globals are found automatically, on `PATH` or not |
+| `CMA_CURSOR_BIN` | The same, for `cursor-agent` |
+| `CMA_GEMINI_BIN` | The same, for `gemini` |
 | `CMA_IDLE_TIMEOUT_MS` | How long a run may produce **no output** before it is stopped (default 600000 — 10 min, which clears the longest single Bash tool call). This is a silence budget, not a duration budget — a run that keeps streaming never hits it, however long it takes |
 | `CMA_MAX_RUN_MS` | Backstop for a wedged process that is somehow still emitting (default 4 h). Not a budget for real work |
 
@@ -235,12 +291,27 @@ caffeinate -s cma-agent start
 
 ## Depending on another product's CLI
 
-Every Claude Code flag this companion relies on is gathered in the `CLI` object
-at the top of `src/claude.js`. They are verified against **Claude Code 2.1.220**.
-If a Claude Code upgrade breaks a run, that object is the only place that should
-need editing.
+One adapter per runtime, in `src/runtimes/`, each opening with a `CLI` object
+that gathers every flag we depend on. When a vendor upgrade breaks a run, that
+object is the only thing that should need editing — check the installed build's
+`--help` first.
 
-Two behaviours worth knowing about that build, both handled in `src/claude.js`:
+| Adapter | Verified against |
+| --- | --- |
+| `src/runtimes/claude-code.js` | Claude Code 2.1.220 |
+| `src/runtimes/cursor.js` | the flag surface two independent third-party adapters use (`@sumeru/adapter-cursor-agent`, `pi-cursor-agent`) plus Cursor's CLI reference |
+| `src/runtimes/gemini.js` | flags read out of the shipped bundle of `@google/gemini-cli` 0.54.4 |
+
+`src/engine.js` holds everything that is the same whatever the vendor: spawning,
+the NDJSON reader, the idle contract, the heartbeat, partial text, and the
+cancel path. It never names a runtime.
+
+`agent/test/runtimes.test.js` asserts that the three express the SAME allowance
+in their three different syntaxes — Claude Code as `--allowedTools`, Cursor as a
+`permissions.json`, Gemini as `--approval-mode` plus `--allowed-tools`. That is
+the test that catches "we accidentally gave Cursor a shell".
+
+Two behaviours worth knowing about Claude Code, both handled in its adapter:
 
 - The result envelope has no top-level `model`; the model that ran is the key of
   `modelUsage`.
