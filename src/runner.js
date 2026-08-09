@@ -1,8 +1,9 @@
 import os from "node:os"
 
 import * as api from "./api.js"
-import { claudeAdvice, claudeVersion, runCompletion } from "./claude.js"
-import { scanProfiles, resolveSlug, RUNTIME } from "./profiles.js"
+import { runCompletion } from "./engine.js"
+import { scanProfiles, resolveSlug, runtimeVersions } from "./profiles.js"
+import { getRuntime, installedRuntimes, RUNTIMES } from "./runtimes/index.js"
 import { resolveRepo, runCommand, COMMANDS } from "./repos.js"
 import { VERSION } from "./version.js"
 
@@ -18,19 +19,25 @@ const BACKOFF_START_MS = 2000
 const BACKOFF_MAX_MS = 30000
 
 export async function start({ log = console.log } = {}) {
-  const claudeVer = await claudeVersion()
-  if (!claudeVer) {
-    log(`! ${claudeAdvice() || "Claude Code isn't usable on this machine."}`)
+  const installed = installedRuntimes()
+  if (installed.length === 0) {
+    log("! No coding CLI this companion can drive is installed on this machine.")
+    for (const runtime of RUNTIMES) log(`    ${runtime.name}: ${runtime.install}`)
     return 1
   }
+
+  const versions = await runtimeVersions()
 
   // Say it even on success: a service started by launchd will be running the
   // copy we resolved, not whatever the user's terminal finds, and the two
   // disagreeing is worth seeing in the log before it causes confusion.
-  const advice = claudeAdvice()
-  if (advice) log(`  ${advice}`)
+  for (const runtime of installed) {
+    const advice = runtime.advice()
+    if (advice) log(`  ${advice}`)
+  }
 
-  log(`cma-agent ${VERSION} · Claude Code ${claudeVer}`)
+  const summary = installed.map((r) => `${r.name} ${versions[r.id] || "?"}`).join(" · ")
+  log(`cma-agent ${VERSION} · ${summary}`)
   log(`Host: ${os.hostname()}`)
 
   let running = true
@@ -43,7 +50,7 @@ export async function start({ log = console.log } = {}) {
 
   const beat = async () => {
     try {
-      await api.heartbeat({ agentVersion: VERSION, claudeCodeVersion: claudeVer })
+      await api.heartbeat({ agentVersion: VERSION, runtimeVersions: versions })
     } catch (error) {
       if (error.status === 409) {
         log("! This machine's session lapsed after two weeks of silence. Run `cma-agent verify`.")
@@ -129,11 +136,18 @@ async function handleJob(job, log) {
     return
   }
 
-  // The server may know about runtimes this build can't drive. Refusing with a
-  // clear reason beats running the job under the wrong CLI, which would spend
-  // the wrong subscription.
-  if (job.runtime && job.runtime !== RUNTIME) {
-    const message = `This machine's companion runs ${RUNTIME}, not ${job.runtime}. Update cma-agent, or point that provider at a different runtime.`
+  // The server may know about runtimes this build can't drive, or name one
+  // whose CLI isn't installed here. Refusing with a clear reason beats running
+  // the job under the wrong CLI, which would spend the wrong subscription.
+  //
+  // Two different failures, two different messages: "update the companion" and
+  // "install the CLI" send someone to opposite places.
+  const runtime = job.runtime ? getRuntime(job.runtime) : getRuntime(null)
+  if (!runtime || !runtime.resolveBin().bin) {
+    const message = runtime
+      ? `${runtime.name} isn't installed on this machine. Install it from ${runtime.install}, then run \`cma-agent runtimes:scan\`.`
+      : `This companion can't drive "${job.runtime}". Update cma-agent, or point that provider at a different runtime.`
+
     log(`✗ ${message}`)
     try {
       await api.submitResult(job.id, { error: message })
@@ -164,13 +178,13 @@ async function handleJob(job, log) {
   }
 
   log(
-    `→ Running ${job.model || "default model"} on "${job.profile_slug || "default"}"` +
+    `→ ${runtime.name}: ${job.model || "default model"} on "${job.profile_slug || "default"}"` +
     `${workdir ? ` in ${workdir}` : ""}…`
   )
 
   try {
     const output = await runCompletion(
-      { ...job, workdir, profileSlug: resolveSlug(job.profile_slug) },
+      { ...job, runtime: runtime.id, workdir, profileSlug: resolveSlug(job.profile_slug) },
       {
         // Two jobs at once: keep the server's wait alive, and give the person
         // watching the web app the same running ticker they would see in a

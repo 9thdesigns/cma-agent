@@ -12,7 +12,8 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 
-import { baseArgs, bufferedArgs, streamingArgs, withoutCapabilityFlags } from "../src/claude.js"
+import { baseArgs, bufferedArgs, streamingArgs } from "../src/runtimes/claude-code.js"
+import { withoutCapabilityFlags } from "../src/engine.js"
 import { TOOLS, operationFor } from "../src/mcp.js"
 
 const valueOf = (args, flag) => {

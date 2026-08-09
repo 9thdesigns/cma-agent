@@ -1,6 +1,6 @@
 {
   "name": "@configuremyai/cma-agent",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Runs Configure My AI work on your own machine using the Claude Code you already signed into.",
   "type": "module",
   "bin": {

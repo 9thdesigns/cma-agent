@@ -4,23 +4,29 @@ import readline from "node:readline/promises"
 import { stdin, stdout } from "node:process"
 
 import * as api from "../src/api.js"
-import { claudeAdvice, claudeVersion, loginProfile, resolveClaude } from "../src/claude.js"
+import { loginProfile, runtimeVersion } from "../src/engine.js"
 import { readConfig, writeConfig, serverUrl, deviceToken } from "../src/config.js"
 import { serve as serveGithubMcp } from "../src/mcp.js"
-import { addProfile, listProfiles, removeProfile, scanProfiles } from "../src/profiles.js"
+import {
+  addProfile, listProfiles, removeProfile, scanProfiles, runtimeVersions, DEFAULT_RUNTIME
+} from "../src/profiles.js"
+import { getRuntime, installedRuntimes, RUNTIMES } from "../src/runtimes/index.js"
 import { addRoot, listRoots, removeRoot, reposList } from "../src/repos.js"
 import { start } from "../src/runner.js"
 import { VERSION } from "../src/version.js"
 
 const HELP = `cma-agent ${VERSION}
 
-Runs Configure My AI work on this machine using the Claude Code you already
-signed into. Your Claude login never leaves this computer.
+Runs Configure My AI work on this machine using a coding CLI you already
+installed and signed into. Your vendor logins never leave this computer.
+
+Runtimes this build can drive:
+${RUNTIMES.map((r) => `  ${r.id.padEnd(12)} ${r.name} (${r.cli})`).join("\n")}
 
 Setup
   pair                          Link this machine to your Configure My AI account
   verify                        Restore a session that lapsed after two weeks
-  status                        Show pairing, session and Claude login state
+  status                        Show pairing, session and login state
 
 Running
   start                         Wait for work and run it (leave this running)
@@ -32,13 +38,18 @@ Local repositories
   repos:list                    Show the shared folders and what was found
   repos:remove ~/code           Stop sharing a folder
 
-Claude logins
-  claude:add --label "Work"     Add a separate Claude login and sign into it
-       [--account you@work.com]   Optional masked hint, so you can tell logins apart
-  claude:login --profile work   Sign a login in again after it expires
-  claude:list                   Show the logins on this machine
-  claude:scan                   Re-check every login and report to the web app
-  claude:remove --profile work  Delete a login and its credential from this machine
+Logins
+  runtimes:list                 Show every runtime and the logins on this machine
+  runtimes:add --runtime cursor --label "Work"
+       [--account you@work.com]   Add a separate login and sign into it
+  runtimes:login --runtime cursor [--profile work]
+                                Sign a login in again after it expires
+  runtimes:scan                 Re-check every login and report to the web app
+  runtimes:remove --runtime cursor --profile work
+                                Delete a login and its credential from this machine
+
+  claude:add / claude:login / claude:list / claude:scan / claude:remove
+                                The same commands for Claude Code, kept working
 
 Options
   --server <url>                Point at a different Configure My AI host
@@ -73,21 +84,53 @@ async function ask(question) {
   }
 }
 
+// Which runtime a command is about.
+//
+// `--runtime` when given; otherwise the only installed one, because a machine
+// with just Claude Code on it should never have to name it. Ambiguity is an
+// error rather than a guess: picking for someone with two CLIs installed would
+// sign them into the wrong account.
+function resolveRuntimeArg(args, { fallback = null } = {}) {
+  const requested = args.runtime
+  if (requested && requested !== true) {
+    const runtime = getRuntime(String(requested))
+    if (!runtime) {
+      throw new Error(`Unknown runtime "${requested}". Known: ${RUNTIMES.map((r) => r.id).join(", ")}`)
+    }
+    return runtime
+  }
+
+  if (fallback) return getRuntime(fallback)
+
+  const installed = installedRuntimes()
+  if (installed.length === 1) return installed[0]
+  if (installed.length === 0) {
+    throw new Error("No runtime this companion can drive is installed. Run `cma-agent status`.")
+  }
+
+  throw new Error(
+    `More than one runtime is installed, so say which: --runtime ${installed.map((r) => r.id).join(" | ")}`
+  )
+}
+
 async function cmdPair(args) {
   if (args.server) writeConfig({ server: String(args.server).replace(/\/+$/, "") })
 
-  const version = await claudeVersion()
-  if (!version) {
+  const installed = installedRuntimes()
+  if (installed.length === 0) {
     // One message for one cause. This used to say "isn't installed, or isn't
     // on PATH" and then advise installing it — which is the wrong remedy for
     // the more common half of that sentence, and sends someone to reinstall
     // software they already have.
-    console.error(claudeAdvice() || "Claude Code isn't usable on this machine.")
+    console.error("No coding CLI this companion can drive is installed on this machine:")
+    for (const runtime of RUNTIMES) console.error(`  ${runtime.name}: ${runtime.install}`)
     return 1
   }
 
-  const advice = claudeAdvice()
-  if (advice) console.error(advice)
+  for (const runtime of installed) {
+    const advice = runtime.advice()
+    if (advice) console.error(advice)
+  }
 
   const code = args.code || (await ask(`Pairing code from ${serverUrl()}/devices/setup: `))
   if (!code) {
@@ -96,7 +139,7 @@ async function cmdPair(args) {
   }
 
   // Report the logins during pairing so the web walkthrough can tick both
-  // steps at once for anyone who was already signed into Claude Code.
+  // steps at once for anyone who was already signed in.
   const profiles = await scanProfiles()
 
   try {
@@ -125,7 +168,7 @@ async function cmdVerify() {
     const result = await api.verify({
       profiles: await scanProfiles(),
       agentVersion: VERSION,
-      claudeCodeVersion: await claudeVersion()
+      runtimeVersions: await runtimeVersions()
     })
     console.log(`✓ ${result.device.name} verified. Session runs to ${new Date(result.device.session_expires_at).toLocaleString()}.`)
     printProfiles(result.device.profiles)
@@ -146,25 +189,40 @@ async function cmdVerify() {
 // invisible. Now it asks.
 async function cmdStatus() {
   const config = readConfig()
-  const version = await claudeVersion()
-  const { bin, source } = resolveClaude()
   const next = []
 
   console.log(`cma-agent ${VERSION}`)
   console.log(`Server:      ${serverUrl()}`)
 
   console.log("\nOn this machine")
-  console.log(`  Claude Code:  ${version || "not found"}`)
-  if (bin) console.log(`                ${bin}  (${source})`)
-  if (!version) next.push("Install Claude Code and sign in: https://claude.com/product/claude-code")
+  let anyInstalled = false
+  for (const runtime of RUNTIMES) {
+    const { bin, source } = runtime.resolveBin()
+    const version = bin ? await runtimeVersion(runtime) : null
+    if (version) anyInstalled = true
 
-  const advice = claudeAdvice()
-  if (advice && version) console.log(`                ${advice.split("\n")[0]}`)
+    console.log(`  ${`${runtime.name}:`.padEnd(15)} ${version || "not found"}`)
+    if (bin) console.log(`  ${"".padEnd(15)} ${bin}  (${source})`)
+
+    const advice = runtime.advice()
+    if (advice && version) console.log(`  ${"".padEnd(15)} ${advice.split("\n")[0]}`)
+
+    // What a runtime cannot do is worth saying here rather than leaving
+    // someone to discover it when a session ends by asking them to push its
+    // own work by hand.
+    if (version && runtime.limitations) {
+      for (const limitation of runtime.limitations) console.log(`  ${"".padEnd(15)} · ${limitation}`)
+    }
+  }
+
+  if (!anyInstalled) {
+    next.push(`Install a coding CLI: ${RUNTIMES.map((r) => r.install).join(" or ")}`)
+  }
 
   const local = await scanProfiles()
   printProfiles(local, "  ")
-  if (version && !local.some((p) => p.status === "ready")) {
-    next.push('Sign a login in: cma-agent claude:add --label "Work"')
+  if (anyInstalled && !local.some((p) => p.status === "ready")) {
+    next.push('Sign a login in: cma-agent runtimes:add --runtime <id> --label "Work"')
   }
 
   console.log("\nConfigure My AI")
@@ -213,7 +271,8 @@ async function cmdStatus() {
     console.log("  Logins there:")
     for (const p of knownProfiles) {
       const state = p.status === "ready" ? "" : `  — ${String(p.status).replace("_", " ")}`
-      console.log(`    ${p.status === "ready" ? "✓" : "✗"} ${p.label}  [${p.slug}]${state}`)
+      const label = getRuntime(p.runtime)?.name || p.runtime || "?"
+      console.log(`    ${p.status === "ready" ? "✓" : "✗"} ${label} · ${p.label}  [${p.slug}]${state}`)
     }
   }
 
@@ -225,9 +284,19 @@ async function cmdStatus() {
   const remoteReady = knownProfiles.filter((p) => p.status === "ready")
 
   if (localReady.length > 0 && remoteReady.length === 0) {
-    next.push("This machine has a working login Configure My AI hasn't been told about: cma-agent claude:scan")
+    next.push("This machine has a working login Configure My AI hasn't been told about: cma-agent runtimes:scan")
   } else if (remoteReady.length > 0 && credentials.length === 0) {
-    next.push("A login is reported but no provider exists — run `cma-agent claude:scan` to trigger it again")
+    next.push("A login is reported but no provider exists — run `cma-agent runtimes:scan` to trigger it again")
+  }
+
+  // A runtime the machine can drive but has never reported is the quiet
+  // failure this whole command exists for: the picker on the web app simply
+  // won't offer it, with nothing anywhere saying why.
+  const reportedRuntimes = new Set(knownProfiles.map((p) => p.runtime))
+  for (const runtime of installedRuntimes()) {
+    if (reportedRuntimes.has(runtime.id)) continue
+    if (!local.some((p) => p.runtime === runtime.id && p.status === "ready")) continue
+    next.push(`${runtime.name} works here but hasn't reached the web app: cma-agent runtimes:scan`)
   }
 
   if (!device.online) {
@@ -318,69 +387,102 @@ async function cmdReposRemove(args) {
   return 0
 }
 
-async function cmdClaudeAdd(args) {
-  const label = args.label
-  if (!label || label === true) {
-    console.error('Give the login a label, e.g. cma-agent claude:add --label "Work"')
-    return 1
-  }
+// ---------------------------------------------------------------------------
+// Logins, for any runtime.
+//
+// `fallbackRuntime` is what makes `claude:add` keep meaning Claude Code on a
+// machine that now also has Cursor installed. The old commands are not
+// deprecated aliases that guess — they are pinned.
+// ---------------------------------------------------------------------------
 
-  let profile
+async function cmdRuntimeAdd(args, fallbackRuntime = null) {
+  let runtime
   try {
-    profile = addProfile(String(label), { account: args.account === true ? null : args.account })
+    runtime = resolveRuntimeArg(args, { fallback: fallbackRuntime })
   } catch (error) {
     console.error(`✗ ${error.message}`)
     return 1
   }
 
-  console.log(`Signing into Claude for "${profile.label}" — your browser will open.`)
-  console.log("This is Anthropic's own sign-in. Configure My AI never sees it.\n")
+  const label = args.label
+  if (!label || label === true) {
+    console.error(`Give the login a label, e.g. cma-agent runtimes:add --runtime ${runtime.id} --label "Work"`)
+    return 1
+  }
 
-  await loginProfile(profile.slug)
+  let profile
+  try {
+    profile = addProfile(runtime.id, String(label), { account: args.account === true ? null : args.account })
+  } catch (error) {
+    console.error(`✗ ${error.message}`)
+    return 1
+  }
+
+  console.log(`Signing into ${runtime.name} for "${profile.label}" — your browser will open.`)
+  console.log(`This is ${runtime.name}'s own sign-in. Configure My AI never sees it.\n`)
+
+  await loginProfile(runtime, profile.slug)
 
   // Confirm against what we can actually see, rather than assuming the sign-in
   // took. Claude Code keeps credentials in the macOS Keychain, so a per-profile
-  // CLAUDE_CONFIG_DIR does not always isolate them the way it does on Linux —
+  // config directory does not always isolate them the way it does on Linux —
   // "you signed in" and "this profile resolves" are genuinely different claims.
   const scanned = await scanProfiles()
-  const mine = scanned.find((p) => p.slug === profile.slug)
+  const mine = scanned.find((p) => p.slug === profile.slug && p.runtime === runtime.id)
   const failure = await reportProfiles(scanned)
 
   if (mine?.status !== "ready") {
     console.error(`\n✗ "${profile.label}" still isn't signing in (${mine?.status || "not found"}).`)
-    console.error(`  Try again with: cma-agent claude:login --profile ${profile.slug}`)
+    console.error(`  Try again with: cma-agent runtimes:login --runtime ${runtime.id} --profile ${profile.slug}`)
     return 1
   }
 
   if (failure) {
     console.error(`\n! "${profile.label}" works on this machine, but Configure My AI wasn't told: ${failure}`)
-    console.error("  Fix that, then run: cma-agent claude:scan")
+    console.error("  Fix that, then run: cma-agent runtimes:scan")
     return 1
   }
 
-  console.log(`\n✓ "${profile.label}" is ready and reported. Pick it on an Anthropic provider in the web app.`)
+  console.log(`\n✓ "${profile.label}" is ready and reported. Pick it on a Local machine provider in the web app.`)
   return 0
 }
 
-async function cmdClaudeLogin(args) {
-  const slug = args.profile
-  if (!slug || slug === true) {
-    console.error("Which login? e.g. cma-agent claude:login --profile work")
+async function cmdRuntimeLogin(args, fallbackRuntime = null) {
+  let runtime
+  try {
+    runtime = resolveRuntimeArg(args, { fallback: fallbackRuntime })
+  } catch (error) {
+    console.error(`✗ ${error.message}`)
     return 1
   }
 
-  await loginProfile(slug === "default" ? "" : String(slug))
+  if (!runtime.loginArgs() || runtime.loginArgs().length === 0) {
+    console.error(`${runtime.name} has no sign-in command we can drive. ${runtime.loginHint}.`)
+    return 1
+  }
+
+  const slug = args.profile === true || !args.profile ? "" : String(args.profile)
+  await loginProfile(runtime, slug === "default" ? "" : slug)
   await reportProfiles()
   console.log("✓ Signed in.")
   return 0
 }
 
-async function cmdClaudeList() {
+async function cmdRuntimeList() {
+  for (const runtime of RUNTIMES) {
+    const { bin } = runtime.resolveBin()
+    const mine = listProfiles(runtime)
+    console.log(`${runtime.name}  [${runtime.id}]  ${bin ? "installed" : "not installed"}`)
+    if (mine.length > 0) {
+      for (const profile of mine) console.log(`  · ${profile.label}  [${profile.slug}]`)
+    }
+  }
+
   printProfiles(await scanProfiles())
   return 0
 }
 
-async function cmdClaudeScan() {
+async function cmdRuntimeScan() {
   const profiles = await scanProfiles()
   printProfiles(profiles)
   const failure = await reportProfiles(profiles)
@@ -392,15 +494,23 @@ async function cmdClaudeScan() {
   return 0
 }
 
-async function cmdClaudeRemove(args) {
+async function cmdRuntimeRemove(args, fallbackRuntime = null) {
+  let runtime
+  try {
+    runtime = resolveRuntimeArg(args, { fallback: fallbackRuntime })
+  } catch (error) {
+    console.error(`✗ ${error.message}`)
+    return 1
+  }
+
   const slug = args.profile
   if (!slug || slug === true) {
-    console.error("Which login? e.g. cma-agent claude:remove --profile work")
+    console.error(`Which login? e.g. cma-agent runtimes:remove --runtime ${runtime.id} --profile work`)
     return 1
   }
 
   try {
-    removeProfile(String(slug))
+    removeProfile(runtime.id, String(slug))
   } catch (error) {
     console.error(`✗ ${error.message}`)
     return 1
@@ -416,8 +526,8 @@ async function cmdClaudeRemove(args) {
 // This used to return a bare false that every caller ignored, so `claude:add`
 // printed "✓ ready" whether or not the login had reached the server. A sync
 // that silently fails and then congratulates you is worse than one that
-// crashes: the web app sits there saying "No Claude logins reported yet" and
-// nothing on the machine disagrees with it.
+// crashes: the web app sits there saying "No logins reported yet" and nothing
+// on the machine disagrees with it.
 async function reportProfiles(profiles) {
   try {
     await api.syncProfiles(profiles || (await scanProfiles()))
@@ -431,16 +541,17 @@ async function reportProfiles(profiles) {
 
 function printProfiles(profiles, indent = "") {
   if (!profiles || profiles.length === 0) {
-    console.log(indent ? `${indent}Logins here: none found.` : "\nClaude logins: none found.")
+    console.log(indent ? `${indent}Logins here: none found.` : "\nLogins: none found.")
     return
   }
 
-  console.log(indent ? `${indent}Logins here:` : "\nClaude logins:")
+  console.log(indent ? `${indent}Logins here:` : "\nLogins:")
   for (const profile of profiles) {
     const mark = profile.status === "ready" ? "✓" : profile.status === "logged_out" ? "✗" : "?"
     const hint = profile.account_hint ? ` (${profile.account_hint})` : ""
-    const state = profile.status === "ready" ? "" : `  — ${profile.status.replace("_", " ")}`
-    console.log(`${indent}  ${mark} ${profile.label}${hint}  [${profile.slug}]${state}`)
+    const state = profile.status === "ready" ? "" : `  — ${String(profile.status).replace(/_/g, " ")}`
+    const runtimeName = getRuntime(profile.runtime)?.name || profile.runtime || "?"
+    console.log(`${indent}  ${mark} ${runtimeName} · ${profile.label}${hint}  [${profile.slug}]${state}`)
   }
 }
 
@@ -457,12 +568,23 @@ async function main() {
     case "repos:add": return cmdReposAdd(args)
     case "repos:list": return cmdReposList()
     case "repos:remove": return cmdReposRemove(args)
-    case "claude:add": return cmdClaudeAdd(args)
-    case "claude:login": return cmdClaudeLogin(args)
-    case "claude:list": return cmdClaudeList()
-    case "claude:scan": return cmdClaudeScan()
-    case "claude:remove": return cmdClaudeRemove(args)
-    // Not for people. Claude Code spawns this as an MCP server for a repository
+
+    case "runtimes:add": return cmdRuntimeAdd(args)
+    case "runtimes:login": return cmdRuntimeLogin(args)
+    case "runtimes:list": return cmdRuntimeList()
+    case "runtimes:scan": return cmdRuntimeScan()
+    case "runtimes:remove": return cmdRuntimeRemove(args)
+
+    // The Claude Code commands as they were. Pinned to claude_code rather than
+    // resolved, so muscle memory and every existing walkthrough keep meaning
+    // what they meant on a machine that has since installed Cursor too.
+    case "claude:add": return cmdRuntimeAdd(args, DEFAULT_RUNTIME)
+    case "claude:login": return cmdRuntimeLogin(args, DEFAULT_RUNTIME)
+    case "claude:list": return cmdRuntimeList()
+    case "claude:scan": return cmdRuntimeScan()
+    case "claude:remove": return cmdRuntimeRemove(args, DEFAULT_RUNTIME)
+
+    // Not for people. The runtime spawns this as an MCP server for a repository
     // turn, talking JSON-RPC over stdio; its credentials arrive in the
     // environment. Undocumented in HELP because typing it by hand does nothing
     // useful — it would sit waiting on stdin.
