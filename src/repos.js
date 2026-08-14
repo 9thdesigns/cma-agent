@@ -478,9 +478,36 @@ export async function branchDelete(params) {
 // no tools pointed at anything, and — following its instructions exactly —
 // asked the user to paste files. With it the model gets the real repository and
 // behaves like Claude Code, because it IS Claude Code.
-export async function ensureCheckout(params) {
+// One repository is prepared at a time, however many sessions ask at once.
+//
+// Concurrency made this necessary rather than optional: two sessions starting
+// together both run `repo.ensure` for the same repository, and git does not
+// take kindly to it — two clones into one directory, or two fetches racing for
+// the same ref lock. The sessions themselves stay parallel; only the moment
+// that touches the shared clone is single-file.
+//
+// In-process and per-slug. It does not need to survive a restart: nothing is
+// half-written that the next `ensure` cannot repair.
+const repoLocks = new Map()
+
+function withRepoLock(key, work) {
+  const queue = (repoLocks.get(key) || Promise.resolve()).then(work, work)
+  // Stored swallowing failures: this chain is only for ordering, and a
+  // rejection here must not become an unhandled one or poison the next caller.
+  repoLocks.set(key, queue.catch(() => {}))
+  return queue
+}
+
+export function ensureCheckout(params) {
+  // Sanitised before the lock so a bad slug fails the same way it always has,
+  // rather than queueing behind real work first.
+  return withRepoLock(sanitizeSlug(params.github), () => prepareCheckout(params))
+}
+
+async function prepareCheckout(params) {
   const slug = sanitizeSlug(params.github)
   const branch = params.branch ? sanitizeBranch(params.branch) : null
+  const workspace = params.workspace ? sanitizeWorkspace(params.workspace) : null
   const dir = path.join(WORKSPACES_DIR, slug.replace("/", "__"))
 
   fs.mkdirSync(WORKSPACES_DIR, { recursive: true, mode: 0o700 })
@@ -525,7 +552,78 @@ export async function ensureCheckout(params) {
     // working tree, and saying so beats refusing to run at all.
   }
 
+  // A session that named itself gets its own working tree off this clone.
+  //
+  // Without it, two sessions on one repository shared a directory: the second
+  // one's checkout moved the first one's HEAD mid-run and both models edited
+  // the same files. That is the "one conflicting with another" that made
+  // running several local sessions at once unsafe, and no amount of queueing
+  // fixes it — it is a property of the checkout, not of the schedule.
+  //
+  // The clone above stays the shared cache: it holds the objects, it keeps the
+  // base branch fresh, and every worktree shares its refs, so a second session
+  // costs a working tree rather than a second clone.
+  if (workspace) {
+    const isolated = await addWorktree(dir, slug, workspace, branch)
+    if (isolated) {
+      return { ...(await describe(isolated)), created: fresh, managed: true, isolated: true }
+    }
+    // Fell through — a git too old for worktrees, or one that refused. Sharing
+    // the clone is worse than isolating it and far better than refusing to run,
+    // so the session gets the cache directory exactly as it did before.
+  }
+
   return { ...(await describe(dir)), created: fresh, managed: true }
+}
+
+// One session's working tree, hung off the shared clone.
+//
+// Detached on purpose. A branch may only be checked out in one worktree at a
+// time, so two sessions both starting from `main` would collide on the second —
+// the very failure this is here to remove. Detached at the base commit is the
+// same starting point without the exclusivity, and `git.push` creates the
+// session's real branch from there exactly as it always has.
+//
+// Returns the directory, or null when this git can't do it — every caller
+// treats null as "carry on with the shared clone".
+async function addWorktree(cacheDir, slug, workspace, branch) {
+  const dir = path.join(WORKSPACES_DIR, `${slug.replace("/", "__")}@${workspace}`)
+
+  // Clears administrative entries for worktrees whose directories are gone
+  // (someone tidied ~/.configure-my-ai by hand). Without it git refuses to
+  // re-add the same path.
+  await git(cacheDir, ["worktree", "prune"])
+
+  if (fs.existsSync(path.join(dir, ".git"))) {
+    // It already exists, so it is mid-session: its HEAD, its branch and its
+    // uncommitted work belong to that session. Updating it here would be this
+    // turn stepping on the last one — the exact thing worktrees are here to
+    // prevent. Fetching happened in the cache and refs are shared, so it can
+    // already see everything new.
+    return dir
+  }
+
+  const start = await worktreeStart(cacheDir, branch)
+  const added = await git(cacheDir, ["worktree", "add", "--detach", dir, start],
+                          { timeoutMs: CLONE_TIMEOUT_MS })
+  return added.ok ? dir : null
+}
+
+// Where a new session's tree starts: the remote's idea of the base branch,
+// falling back to the remote default, then to whatever the clone has. Remote
+// refs rather than local ones because the fetch above has just made them the
+// freshest thing here.
+async function worktreeStart(cacheDir, branch) {
+  const candidates = []
+  if (branch) candidates.push(`origin/${branch}`, branch)
+
+  const fallback = await defaultBranch(cacheDir)
+  if (fallback) candidates.push(`origin/${fallback}`)
+
+  for (const ref of candidates) {
+    if ((await git(cacheDir, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])).ok) return ref
+  }
+  return "HEAD"
 }
 
 // owner/repo, and nothing that could be read as a flag or a path.
@@ -535,6 +633,16 @@ function sanitizeSlug(input) {
     throw new Error(`"${input}" isn't a usable owner/repo.`)
   }
   return slug
+}
+
+// The server's name for one session, used as a directory suffix. Narrow on
+// purpose: it arrives over the network and becomes a path, so it is reduced to
+// characters that cannot traverse, cannot hide a separator and cannot be read
+// as a flag. Anything that survives to nothing is treated as "no workspace"
+// rather than as an error — the session still runs, just in the shared clone.
+function sanitizeWorkspace(input) {
+  const cleaned = String(input || "").trim().replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64)
+  return cleaned || null
 }
 
 // git accepts a lot as a ref name; we accept much less. Anything outside this

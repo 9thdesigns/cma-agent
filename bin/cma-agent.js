@@ -12,7 +12,7 @@ import {
 } from "../src/profiles.js"
 import { getRuntime, installedRuntimes, RUNTIMES } from "../src/runtimes/index.js"
 import { addRoot, listRoots, removeRoot, reposList } from "../src/repos.js"
-import { start } from "../src/runner.js"
+import { start, maxJobs } from "../src/runner.js"
 import { VERSION } from "../src/version.js"
 
 const HELP = `cma-agent ${VERSION}
@@ -30,6 +30,10 @@ Setup
 
 Running
   start                         Wait for work and run it (leave this running)
+  max-jobs [n|none]             Cap how many jobs this machine takes at once,
+                                  whatever the Devices page asks for. The usual
+                                  place to set this is "Jobs at once" on the
+                                  Devices page — it needs no restart.
 
 Local repositories
   repos:add ~/code              Share a folder so the web app can see the git
@@ -555,6 +559,49 @@ function printProfiles(profiles, indent = "") {
   }
 }
 
+// A ceiling this machine keeps for itself.
+//
+// The setting people use is "Jobs at once" on the Devices page — it is where
+// they already are, it needs no terminal, and it applies within one heartbeat.
+// This exists for the case that page cannot express: a machine that must not
+// go above a number whatever the account asks for, because it is old, or
+// shared, or someone is trying to work on it. The two are combined by taking
+// the LOWER of them, so this can only ever restrain the page, never overrule
+// it upwards.
+function cmdMaxJobs(args) {
+  const requested = args._[0]
+  const local = Number(readConfig().maxJobs)
+  const hasLocal = Number.isFinite(local) && local >= 1
+
+  if (requested === undefined) {
+    console.log(
+      hasLocal
+        ? `This machine will not run more than ${local} jobs at once, whatever the Devices page asks for.`
+        : "This machine follows the Devices page — set \"Jobs at once\" there (three by default)."
+    )
+    console.log("Cap it locally with:  cma-agent max-jobs <n>")
+    if (hasLocal) console.log("Remove the cap with:  cma-agent max-jobs none")
+    return 0
+  }
+
+  if (String(requested).toLowerCase() === "none") {
+    writeConfig({ maxJobs: null })
+    console.log("Cap removed. This machine now follows the Devices page.")
+    return 0
+  }
+
+  const value = Number(requested)
+  if (!Number.isFinite(value) || value < 1) {
+    console.error(`"${requested}" isn't a number of jobs. Try: cma-agent max-jobs 3`)
+    return 1
+  }
+
+  writeConfig({ maxJobs: Math.trunc(value) })
+  console.log(`This machine will now run at most ${maxJobs(null)} jobs at once.`)
+  console.log("It takes effect on the next heartbeat — no restart needed.")
+  return 0
+}
+
 async function main() {
   const [, , command, ...rest] = process.argv
   const args = parseArgs(rest)
@@ -563,6 +610,10 @@ async function main() {
   switch (command) {
     case "pair": return cmdPair(args)
     case "start": return start()
+    case "max-jobs": return cmdMaxJobs(args)
+    // The name this shipped under for one prerelease. Aliased rather than
+    // dropped so anything already typing it keeps working.
+    case "concurrency": return cmdMaxJobs(args)
     case "verify": return cmdVerify()
     case "status": return cmdStatus()
     case "repos:add": return cmdReposAdd(args)

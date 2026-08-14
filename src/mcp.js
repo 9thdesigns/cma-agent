@@ -170,6 +170,46 @@ function operationFor(toolName) {
   return String(toolName).replace("_", ".")
 }
 
+// The repositories this session is linked to, when there is more than one.
+// Empty for the ordinary single-repo session, which is why `repo` only shows
+// up in the tool schemas below when there is genuinely a choice to make.
+function linkedRepos() {
+  try {
+    const raw = process.env.CMA_GITHUB_REPOS
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed : []
+  } catch (_error) {
+    return []
+  }
+}
+
+// Every operation acts on ONE repository, so each tool grows a `repo`
+// argument once the session spans several. Added here rather than written
+// into each definition: the answer is the same for all of them, and a schema
+// that lists the legal values is the difference between the model choosing
+// and the model guessing.
+function toolsForSession() {
+  const repos = linkedRepos()
+  if (repos.length < 2) return TOOLS
+
+  const names = repos.map((r) => r.repo).filter(Boolean)
+  const primary = repos.find((r) => r.primary)?.repo || names[0]
+  const description =
+    `Which linked repository to act on, as "owner/repo" — one of: ${names.join(", ")}. ` +
+    `Optional; defaults to ${primary}. A change spanning repositories needs one ` +
+    `call per repository, so pass this explicitly rather than relying on the default.`
+
+  return TOOLS.map((tool) => ({
+    ...tool,
+    inputSchema: {
+      ...tool.inputSchema,
+      type: "object",
+      properties: { ...(tool.inputSchema?.properties || {}), repo: { type: "string", description } }
+    }
+  }))
+}
+
 // The endpoint and token arrive in the environment, put there by the process
 // that launched Claude Code for this job. They are never written to disk and
 // never passed as arguments, so neither a stray file nor `ps` exposes them.
@@ -269,7 +309,7 @@ async function handle(request) {
       return
 
     case "tools/list":
-      respond(id, { tools: TOOLS })
+      respond(id, { tools: toolsForSession() })
       return
 
     case "tools/call": {
