@@ -99,8 +99,15 @@ export function verify({ profiles, agentVersion, runtimeVersions = {} }) {
 // Long-poll. The server holds the request for up to `wait` seconds; the
 // client timeout sits comfortably beyond that so a normal empty poll ends as a
 // 204 rather than as an abort we'd have to distinguish from a real failure.
-export function claimJob({ wait = 25 } = {}) {
-  return request(`/api/agent/v1/jobs/next?wait=${wait}`, {
+//
+// `lane` narrows what this poll will accept — "completions" for model turns,
+// "commands" for the git questions that cost nothing. It exists so the two can
+// be polled separately with separate limits: a `repo.ensure` behind three long
+// coding turns used to wait until it timed out. An older server ignores the
+// parameter and hands back whatever is next, which every caller here handles.
+export function claimJob({ wait = 25, lane = null } = {}) {
+  const query = `wait=${wait}${lane ? `&lane=${encodeURIComponent(lane)}` : ""}`
+  return request(`/api/agent/v1/jobs/next?${query}`, {
     timeoutMs: (wait + 15) * 1000
   }).then((r) => r.data?.job || null)
 }

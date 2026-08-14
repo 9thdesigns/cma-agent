@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process"
 
 import { ensureProfileDir } from "./config.js"
+import { collectDocuments } from "./documents.js"
 import { DEFAULT_RUNTIME, getRuntime } from "./runtimes/index.js"
 
 // ---------------------------------------------------------------------------
@@ -376,6 +377,11 @@ export async function runCompletion(job, { onProgress } = {}) {
   let partialText = ""     // every answer token seen so far, in order
   let postedPartial = ""   // how much of it the server has been sent
 
+  // Every path this run wrote, in order, deduped by the Set. Read back at the
+  // end and sent with the result, so a document produced on this machine
+  // exists somewhere other than this machine. See documents.js.
+  const written = new Set()
+
   // Filled in by runStreaming with a kill() for the running child. Passed to
   // the caller on every progress post so it can stop the run the moment the
   // server answers a heartbeat with "this job was cancelled".
@@ -409,6 +415,11 @@ export async function runCompletion(job, { onProgress } = {}) {
     onEvent: (event) => {
       const text = runtime.partialTextFrom ? runtime.partialTextFrom(event) : null
       if (text) partialText += text
+
+      // A runtime that has not taught us how to spot a write simply reports
+      // no documents — the run is unaffected.
+      const wrote = runtime.writtenPathFrom ? runtime.writtenPathFrom(event) : null
+      if (wrote) written.add(wrote)
 
       const note = runtime.describeEvent(event)
       if (note) lastNote = note
@@ -479,7 +490,21 @@ export async function runCompletion(job, { onProgress } = {}) {
 
   if (!output.content) throw new Error(`${runtime.name} finished without producing an answer.`)
 
-  return output
+  // Last, and never fatal. The answer is already written and the run
+  // succeeded; a file that cannot be read back is a missing card in the web
+  // app, not a failed turn.
+  return { ...output, files: safeCollect(job, written) }
+}
+
+function safeCollect(job, written) {
+  if (!job.workdir || written.size === 0) return []
+
+  try {
+    return collectDocuments(job.workdir, written)
+  } catch (error) {
+    process.stderr.write(`! Couldn't collect this run's documents: ${error.message}\n`)
+    return []
+  }
 }
 
 // Same transport, fewer flags. Used when a build rejects a capability flag we

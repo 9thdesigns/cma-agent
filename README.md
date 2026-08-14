@@ -235,6 +235,38 @@ directory and no elevated mode.
 
 Connections are outbound only. Nothing listens, no ports open, no firewall rules.
 
+### Several sessions at once
+
+The companion claims up to three jobs at a time. Before that it ran one, so a
+second and third chat session sat in a queue that expired after three minutes —
+and the web app reported a machine you could watch working as offline.
+
+The number is **"Jobs at once" on the Devices page** (Edit next to a machine,
+one to five). It rides the heartbeat, so a change applies within seconds
+without restarting anything. `cma-agent max-jobs <n>` sets a local ceiling for
+a machine that must not go above some number whatever the account asks for —
+the two are combined by taking the lower, so the local one can only ever
+restrain the page. `CMA_MAX_JOBS` overrides both, for debugging.
+
+Two things make parallel runs safe rather than merely possible:
+
+* **Repository questions have their own lane.** `repos.list`, `repo.ensure`,
+  `git.push` and friends are polled separately from model turns, because every
+  coding turn *opens* with a `repo.ensure`: behind three long completions in one
+  queue, that question times out and the session quietly loses its working
+  directory.
+* **Each session gets its own working tree.** A session linked to a GitHub
+  repository is given a `git worktree` off one shared clone, named for the
+  session. Two sessions on one repository therefore have separate files and
+  separate branches, where before they shared a directory and edited over each
+  other. The clone is still shared, so a second session costs a working tree
+  rather than a second download.
+
+Sessions running against a folder you shared yourself (`repos:add`) are *not*
+isolated — that directory is yours, and moving your work somewhere else would be
+a surprise. Point two sessions at one shared folder and they will collide, the
+same as two terminals would.
+
 ### A run is bounded by silence, not by duration
 
 There is no "maximum run length" setting, on purpose. Every value we tried was
@@ -255,6 +287,7 @@ distinguish a long run from a dead one — buffering emits nothing until the end
 | --- | --- |
 | `pair` | Link this machine to your account |
 | `start` | Claim and run work (leave running) |
+| `max-jobs [n\|none]` | Local ceiling on jobs at once. The usual place to set this is the Devices page |
 | `verify` | Restore a session that lapsed after two weeks of silence |
 | `status` | Pairing, session and Claude login state |
 | `repos:add PATH` | Share a folder so the web app can see the repositories in it |

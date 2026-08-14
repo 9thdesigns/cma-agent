@@ -236,10 +236,20 @@ export const GITHUB_MCP_SERVER = "cma_github"
 export function envForGithub(job) {
   if (!job.github?.token) return {}
 
-  return {
+  const env = {
     CMA_GITHUB_ENDPOINT: String(job.github.endpoint || ""),
     CMA_GITHUB_TOKEN: String(job.github.token)
   }
+
+  // A session may be linked to several repositories. The list is not a
+  // secret — it is names and branches — but it belongs with the endpoint, so
+  // the MCP server can say which repositories `repo` will accept instead of
+  // describing an argument with no legal values it knows about.
+  if (Array.isArray(job.github.repos) && job.github.repos.length > 1) {
+    env.CMA_GITHUB_REPOS = JSON.stringify(job.github.repos)
+  }
+
+  return env
 }
 
 // The MCP server definition, as every one of these CLIs spells it. `command`

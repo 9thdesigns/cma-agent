@@ -225,6 +225,32 @@ function collapseEvents(events) {
   return { ...out, sawResult }
 }
 
+// Which file, if any, this event WROTE.
+//
+// The same tool_use blocks describeEvent reads, asked a different question:
+// not "what should the ticker say" but "what is now on disk that was not
+// before". That list is how a document a run produced gets back to the web
+// app at all — see documents.js.
+//
+// Writes only. A Read is not a deliverable, and neither is a Grep.
+function writtenPathFrom(event) {
+  if (event?.type !== "assistant") return null
+
+  const blocks = event.message?.content
+  if (!Array.isArray(blocks)) return null
+
+  for (const block of blocks) {
+    if (block?.type !== "tool_use") continue
+    if (!["Write", "Edit", "MultiEdit", "NotebookEdit"].includes(block.name)) continue
+
+    const input = block.input || {}
+    const path = input.file_path || input.notebook_path || input.path
+    if (typeof path === "string" && path.trim()) return path.trim()
+  }
+
+  return null
+}
+
 // Token-level deltas from --include-partial-messages. Only top-level
 // text_deltas are the answer: thinking_delta is private scratchwork,
 // input_json_delta is tool arguments, and anything carrying a
@@ -312,6 +338,7 @@ export const claudeCode = {
   describeEvent,
   collapseEvents,
   partialTextFrom,
+  writtenPathFrom,
   parseBuffered,
   classifyFailure: (detail) =>
     classifyFailure(detail, { name: "Claude", loginHint: "cma-agent runtimes:login --runtime claude_code" }),
