@@ -104,7 +104,9 @@ test("every MCP tool maps onto a server operation name", () => {
   const expected = [
     "repo.info", "branch.list", "branch.create", "branch.delete", "branch.rename",
     "local.push",
-    "pr.open", "pr.list", "pr.get", "pr.update", "pr.comment", "pr.merge"
+    "pr.open", "pr.list", "pr.get", "pr.update", "pr.comment",
+    "deploy.site",
+    "pr.merge"
   ]
 
   assert.deepEqual(TOOLS.map((tool) => operationFor(tool.name)), expected)

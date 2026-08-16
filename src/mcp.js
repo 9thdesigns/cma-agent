@@ -150,6 +150,37 @@ const TOOLS = [
     }
   },
   {
+    name: "deploy_site",
+    description:
+      "Deploy this session's work to its Configure My AI cloud machine and serve it at a public " +
+      "URL — the platform's way to put work live, with or without a repository. With a linked " +
+      "repository the machine pulls the branch from GitHub, so push first (local_push or " +
+      "pr_open); without one it deploys the files this session wrote (fenced files included), so " +
+      "just call it. A site with an index.html at its root is published automatically; pass " +
+      "serve_command for an app that needs its own runtime. Creating the machine bills the " +
+      "workspace, so call this only when the user asked for a deploy or agreed to one. The " +
+      "response includes the URL; the user manages the machine under Devices → Cloud machines.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        branch: {
+          type: "string",
+          description:
+            "Branch to deploy. Defaults to this session's working branch when it exists on GitHub, else the base branch."
+        },
+        dir: {
+          type: "string",
+          description: "Folder to publish, relative to the repository root. Default: the repository root."
+        },
+        serve_command: {
+          type: "string",
+          description: "Command that starts the app on the machine, binding to `port` — for anything busier than static files."
+        },
+        port: { type: "integer", description: "Port the server listens on (default 8080)." }
+      }
+    }
+  },
+  {
     name: "pr_merge",
     description:
       "Merge a pull request. Only do this when the user has explicitly asked for it — an open PR is normally theirs to merge.",
