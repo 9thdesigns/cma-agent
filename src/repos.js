@@ -655,12 +655,29 @@ function sanitizeBranch(input) {
   return name
 }
 
+// A scratch working directory for a session with no repository. Without one,
+// the job carried no workdir at all, Claude Code started with no permission
+// mode and no file tools, and "describe what you want built and I'll write
+// the files" ended in Write being denied — the model pasting a whole site
+// into its reply. Same layout and containment as the repo checkouts: under
+// WORKSPACES_DIR, named by the session's own key, created once and reused so
+// follow-up turns see the earlier files.
+function ensureScratchWorkspace(params) {
+  const key = sanitizeWorkspace(params.workspace)
+  if (!key) throw new Error("workspace.ensure needs a workspace key.")
+
+  const dir = path.join(WORKSPACES_DIR, `scratch__${key}`)
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  return { path: dir }
+}
+
 // Dispatch table the runner hands a job to. Unknown kinds throw here rather
 // than anywhere further in, so a server that is newer than this build gets a
 // clear "update cma-agent" instead of silence.
 export const COMMANDS = {
   "repos.list": reposList,
   "repo.ensure": ensureCheckout,
+  "workspace.ensure": ensureScratchWorkspace,
   "git.summary": summary,
   "git.log": log,
   "git.diff": diff,
