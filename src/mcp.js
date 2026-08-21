@@ -322,60 +322,67 @@ function respondError(id, code, message) {
   write({ jsonrpc: "2.0", id, error: { code, message } })
 }
 
-async function handle(request) {
-  const { id, method, params } = request
+// One rpc loop for every server the companion mounts. `spec` carries what
+// differs — the name Claude Code sees, the tool list, and how a call is
+// executed — so the web server (mcp_web.js) is a spec, not a second copy of
+// this file that can drift.
+function makeHandler(spec) {
+  return async function handle(request) {
+    const { id, method, params } = request
 
-  switch (method) {
-    case "initialize":
-      respond(id, {
-        protocolVersion: PROTOCOL_VERSION,
-        capabilities: { tools: {} },
-        serverInfo: { name: "cma_github", version: "1" }
-      })
-      return
+    switch (method) {
+      case "initialize":
+        respond(id, {
+          protocolVersion: PROTOCOL_VERSION,
+          capabilities: { tools: {} },
+          serverInfo: { name: spec.name, version: "1" }
+        })
+        return
 
-    // Notifications carry no id and take no reply.
-    case "notifications/initialized":
-    case "notifications/cancelled":
-      return
+      // Notifications carry no id and take no reply.
+      case "notifications/initialized":
+      case "notifications/cancelled":
+        return
 
-    case "tools/list":
-      respond(id, { tools: toolsForSession() })
-      return
+      case "tools/list":
+        respond(id, { tools: spec.list() })
+        return
 
-    case "tools/call": {
-      const name = params?.name
-      const tool = TOOLS.find((t) => t.name === name)
-      if (!tool) {
-        respondError(id, -32602, `Unknown tool ${name}`)
+      case "tools/call": {
+        const name = params?.name
+        const tool = spec.tools.find((t) => t.name === name)
+        if (!tool) {
+          respondError(id, -32602, `Unknown tool ${name}`)
+          return
+        }
+
+        try {
+          const result = await spec.call(name, params?.arguments)
+          respond(id, {
+            content: [{ type: "text", text: result.text }],
+            isError: !result.ok
+          })
+        } catch (error) {
+          respond(id, {
+            content: [{ type: "text", text: String(error?.message || error) }],
+            isError: true
+          })
+        }
         return
       }
 
-      try {
-        const result = await callOperation(name, params?.arguments)
-        respond(id, {
-          content: [{ type: "text", text: result.text }],
-          isError: !result.ok
-        })
-      } catch (error) {
-        respond(id, {
-          content: [{ type: "text", text: String(error?.message || error) }],
-          isError: true
-        })
-      }
-      return
+      case "ping":
+        respond(id, {})
+        return
+
+      default:
+        if (id !== undefined) respondError(id, -32601, `Method not found: ${method}`)
     }
-
-    case "ping":
-      respond(id, {})
-      return
-
-    default:
-      if (id !== undefined) respondError(id, -32601, `Method not found: ${method}`)
   }
 }
 
-export async function serve() {
+export async function serveMcp(spec) {
+  const handle = makeHandler(spec)
   const rl = createInterface({ input: process.stdin })
 
   for await (const line of rl) {
@@ -399,6 +406,15 @@ export async function serve() {
   }
 
   return 0
+}
+
+export async function serve() {
+  return serveMcp({
+    name: "cma_github",
+    tools: TOOLS,
+    list: toolsForSession,
+    call: callOperation
+  })
 }
 
 export { TOOLS, operationFor }

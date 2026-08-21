@@ -60,12 +60,17 @@ export function pair({ code, name, platform, agentVersion, profiles }) {
 // `claude_code_version` rides along beside it because an older server reads
 // only that column and would otherwise show "unknown" for every machine the
 // moment this companion ships. It is derived, not separately tracked.
-export function heartbeat({ agentVersion, runtimeVersions = {} }) {
+//
+// `runtime_models` is what only this machine knows: the models somebody pulled
+// onto their own disk. Empty for a machine running nothing but the subscription
+// CLIs, whose catalogues the server holds itself.
+export function heartbeat({ agentVersion, runtimeVersions = {}, runtimeModels = {} }) {
   return request("/api/agent/v1/heartbeat", {
     method: "POST",
     body: {
       agent_version: agentVersion,
       runtime_versions: runtimeVersions,
+      runtime_models: runtimeModels,
       claude_code_version: runtimeVersions.claude_code || null
     }
   }).then((r) => r.data)
@@ -77,20 +82,27 @@ export function status() {
   return request("/api/agent/v1/status").then((r) => r.data)
 }
 
-export function syncProfiles(profiles) {
+// Sent together on purpose: a scan is the moment we learn both what logins
+// resolved AND what models the machine has, and reporting them apart would let
+// a provider exist for a runtime whose model list hadn't landed yet.
+export function syncProfiles(profiles, runtimeModels = null) {
+  const body = { profiles }
+  if (runtimeModels) body.runtime_models = runtimeModels
+
   return request("/api/agent/v1/profiles", {
     method: "PUT",
-    body: { profiles }
+    body
   }).then((r) => r.data)
 }
 
-export function verify({ profiles, agentVersion, runtimeVersions = {} }) {
+export function verify({ profiles, agentVersion, runtimeVersions = {}, runtimeModels = {} }) {
   return request("/api/agent/v1/verify", {
     method: "POST",
     body: {
       profiles,
       agent_version: agentVersion,
       runtime_versions: runtimeVersions,
+      runtime_models: runtimeModels,
       claude_code_version: runtimeVersions.claude_code || null
     }
   }).then((r) => r.data)

@@ -14,7 +14,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 
-import { RUNTIMES, DEFAULT_RUNTIME, getRuntime, runtimeIds } from "../src/runtimes/index.js"
+import { RUNTIMES, DEFAULT_RUNTIME, getRuntime, isHttpRuntime, runtimeIds } from "../src/runtimes/index.js"
 import { claudeCode } from "../src/runtimes/claude-code.js"
 import { cursor, permissionsFor, writeConfig } from "../src/runtimes/cursor.js"
 import { gemini } from "../src/runtimes/gemini.js"
@@ -43,9 +43,24 @@ test("every registered runtime implements the surface the engine calls", () => {
     for (const key of ["id", "name", "cli", "install"]) {
       assert.ok(runtime[key], `${runtime.id} is missing ${key}`)
     }
-    for (const fn of ["streamingArgs", "describeEvent", "collapseEvents", "classifyFailure",
-                      "resolveBin", "advice", "probeArgs", "loginArgs", "envFor"]) {
+
+    // What every runtime owes the engine, whichever transport it uses: read a
+    // stream of events, turn them into an answer, and explain a failure.
+    for (const fn of ["describeEvent", "collapseEvents", "classifyFailure",
+                      "resolveBin", "advice", "loginArgs"]) {
       assert.equal(typeof runtime[fn], "function", `${runtime.id} is missing ${fn}()`)
+    }
+
+    // The rest splits by transport, because an HTTP runtime has no argv to
+    // build, no environment to spawn into, and nothing to probe by running.
+    if (isHttpRuntime(runtime)) {
+      for (const fn of ["buildRequest", "probe"]) {
+        assert.equal(typeof runtime[fn], "function", `${runtime.id} is missing ${fn}()`)
+      }
+    } else {
+      for (const fn of ["streamingArgs", "probeArgs", "envFor"]) {
+        assert.equal(typeof runtime[fn], "function", `${runtime.id} is missing ${fn}()`)
+      }
     }
     // A buffered fallback is optional, but claiming one without implementing
     // it would only be discovered when a run needed it.
@@ -59,7 +74,7 @@ test("every registered runtime implements the surface the engine calls", () => {
 test("runtime ids match what the server stores", () => {
   // These strings are a contract with AiCredential::LOCAL_RUNTIMES. A rename
   // on either side silently produces jobs no machine will claim.
-  assert.deepEqual(runtimeIds(), ["claude_code", "cursor", "gemini_cli"])
+  assert.deepEqual(runtimeIds(), ["claude_code", "cursor", "gemini_cli", "ollama"])
   assert.equal(DEFAULT_RUNTIME, "claude_code")
 })
 

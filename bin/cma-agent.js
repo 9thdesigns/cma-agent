@@ -5,12 +5,15 @@ import { stdin, stdout } from "node:process"
 
 import * as api from "../src/api.js"
 import { loginProfile, runtimeVersion } from "../src/engine.js"
-import { readConfig, writeConfig, serverUrl, deviceToken } from "../src/config.js"
+import { readConfig, writeConfig, serverUrl, deviceToken, profileDir } from "../src/config.js"
 import { serve as serveGithubMcp } from "../src/mcp.js"
+import { serve as serveWebMcp } from "../src/mcp_web.js"
 import {
-  addProfile, listProfiles, removeProfile, scanProfiles, runtimeVersions, DEFAULT_RUNTIME
+  addProfile, duplicateAccounts, listProfiles, removeProfile, scanProfiles, runtimeModels,
+  runtimeVersions,
+  DEFAULT_PROFILE, DEFAULT_RUNTIME
 } from "../src/profiles.js"
-import { getRuntime, installedRuntimes, RUNTIMES } from "../src/runtimes/index.js"
+import { getRuntime, installedRuntimes, isInstalled, RUNTIMES } from "../src/runtimes/index.js"
 import { addRoot, listRoots, removeRoot, reposList } from "../src/repos.js"
 import { start, maxJobs } from "../src/runner.js"
 import { VERSION } from "../src/version.js"
@@ -43,6 +46,8 @@ Local repositories
   repos:remove ~/code           Stop sharing a folder
 
 Logins
+  accounts                      Show which account each login actually signs in
+                                  as, and which provider in the web app spends it
   runtimes:list                 Show every runtime and the logins on this machine
   runtimes:add --runtime cursor --label "Work"
        [--account you@work.com]   Add a separate login and sign into it
@@ -172,7 +177,8 @@ async function cmdVerify() {
     const result = await api.verify({
       profiles: await scanProfiles(),
       agentVersion: VERSION,
-      runtimeVersions: await runtimeVersions()
+      runtimeVersions: await runtimeVersions(),
+      runtimeModels: await runtimeModels()
     })
     console.log(`✓ ${result.device.name} verified. Session runs to ${new Date(result.device.session_expires_at).toLocaleString()}.`)
     printProfiles(result.device.profiles)
@@ -200,9 +206,13 @@ async function cmdStatus() {
 
   console.log("\nOn this machine")
   let anyInstalled = false
+  const localModels = await runtimeModels()
   for (const runtime of RUNTIMES) {
+    // Present is a different question per runtime: a binary for the CLIs, a
+    // server that answers for Ollama. Ask the adapter rather than the PATH.
+    const present = isInstalled(runtime)
     const { bin, source } = runtime.resolveBin()
-    const version = bin ? await runtimeVersion(runtime) : null
+    const version = present ? await runtimeVersion(runtime) : null
     if (version) anyInstalled = true
 
     console.log(`  ${`${runtime.name}:`.padEnd(15)} ${version || "not found"}`)
@@ -210,6 +220,14 @@ async function cmdStatus() {
 
     const advice = runtime.advice()
     if (advice && version) console.log(`  ${"".padEnd(15)} ${advice.split("\n")[0]}`)
+
+    // Models this machine holds itself. Printed here because for a
+    // bring-your-own runtime this IS the capability — "Ollama 0.5.7" says
+    // nothing about whether it can answer anything.
+    const models = localModels[runtime.id]
+    if (models?.length) {
+      console.log(`  ${"".padEnd(15)} models: ${models.slice(0, 6).join(", ")}${models.length > 6 ? `, +${models.length - 6} more` : ""}`)
+    }
 
     // What a runtime cannot do is worth saying here rather than leaving
     // someone to discover it when a session ends by asking them to push its
@@ -281,6 +299,23 @@ async function cmdStatus() {
   }
 
   console.log(`  Providers:    ${credentials.length === 0 ? "none created yet" : credentials.map((c) => c.name).join(", ")}`)
+
+  // The models the server believes this machine has, against the ones it
+  // actually has. For a bring-your-own runtime this is the picker: a model
+  // pulled but never reported is simply not offerable, with nothing anywhere
+  // saying why.
+  const remoteModels = device.runtime_models || {}
+  for (const [runtimeId, mine] of Object.entries(localModels)) {
+    const theirs = remoteModels[runtimeId] || []
+    const missing = mine.filter((m) => !theirs.includes(m))
+    const stale = theirs.filter((m) => !mine.includes(m))
+    if (missing.length === 0 && stale.length === 0) continue
+
+    const name = getRuntime(runtimeId)?.name || runtimeId
+    if (missing.length > 0) console.log(`  ${name}:      not reported yet — ${missing.join(", ")}`)
+    if (stale.length > 0) console.log(`  ${name}:      reported but gone from this machine — ${stale.join(", ")}`)
+    next.push(`Send this machine's ${name} model list: cma-agent runtimes:scan`)
+  }
 
   // The comparison is the point. Each of these is a state the two sides can
   // reach independently, and none of them is visible from one side alone.
@@ -473,13 +508,16 @@ async function cmdRuntimeLogin(args, fallbackRuntime = null) {
 }
 
 async function cmdRuntimeList() {
+  const localModels = await runtimeModels()
+
   for (const runtime of RUNTIMES) {
-    const { bin } = runtime.resolveBin()
     const mine = listProfiles(runtime)
-    console.log(`${runtime.name}  [${runtime.id}]  ${bin ? "installed" : "not installed"}`)
+    console.log(`${runtime.name}  [${runtime.id}]  ${isInstalled(runtime) ? "installed" : "not installed"}`)
     if (mine.length > 0) {
       for (const profile of mine) console.log(`  · ${profile.label}  [${profile.slug}]`)
     }
+    const models = localModels[runtime.id]
+    if (models?.length) console.log(`  models: ${models.join(", ")}`)
   }
 
   printProfiles(await scanProfiles())
@@ -534,7 +572,10 @@ async function cmdRuntimeRemove(args, fallbackRuntime = null) {
 // on the machine disagrees with it.
 async function reportProfiles(profiles) {
   try {
-    await api.syncProfiles(profiles || (await scanProfiles()))
+    // The models ride with the scan: a machine that just pulled one has a
+    // provider whose dropdown is wrong until this lands, and the two facts
+    // are learned in the same breath anyway.
+    await api.syncProfiles(profiles || (await scanProfiles()), await runtimeModels())
     return null
   } catch (error) {
     if (error.status === 401) return "this machine is no longer paired — run `cma-agent pair`"
@@ -552,11 +593,109 @@ function printProfiles(profiles, indent = "") {
   console.log(indent ? `${indent}Logins here:` : "\nLogins:")
   for (const profile of profiles) {
     const mark = profile.status === "ready" ? "✓" : profile.status === "logged_out" ? "✗" : "?"
-    const hint = profile.account_hint ? ` (${profile.account_hint})` : ""
+    // The resolved address when we have it, the masked hint when we don't.
+    // Two logins that both say "d•••@acme.com" are indistinguishable at
+    // exactly the moment you most need to tell them apart.
+    const account = profile.account_email || profile.account_hint
+    const hint = account ? ` (${account})` : ""
     const state = profile.status === "ready" ? "" : `  — ${String(profile.status).replace(/_/g, " ")}`
     const runtimeName = getRuntime(profile.runtime)?.name || profile.runtime || "?"
     console.log(`${indent}  ${mark} ${runtimeName} · ${profile.label}${hint}  [${profile.slug}]${state}`)
+    // The runtime's own sentence about why it isn't ready. Usually the whole
+    // fix ("no models pulled — try `ollama pull llama3.2`").
+    if (profile.detail && profile.status !== "ready") console.log(`${indent}      ${profile.detail}`)
   }
+}
+
+// ---------------------------------------------------------------------------
+// Which account is which.
+//
+// The one question two logins create — "which subscription is this going to
+// spend?" — and until now the only answer anywhere was a label somebody typed.
+// This asks each login's own config directory who it signs in as, checks the
+// sign-in still works, and names the provider in the web app that spends it,
+// so all three facts are on one screen instead of in three places.
+// ---------------------------------------------------------------------------
+async function cmdAccounts() {
+  const scanned = await scanProfiles()
+
+  // Best effort and never fatal: the local half of this answer is the half
+  // people are usually checking, and a machine that hasn't been paired yet —
+  // or is on a train — should still get it.
+  let credentials = null
+  if (deviceToken()) {
+    try {
+      credentials = (await api.status()).credentials || []
+    } catch (_error) {
+      credentials = null
+    }
+  }
+
+  const installed = installedRuntimes()
+  if (installed.length === 0) {
+    console.log("No coding CLI this companion can drive is installed on this machine.")
+    for (const runtime of RUNTIMES) console.log(`  ${runtime.name}: ${runtime.install}`)
+    return 1
+  }
+
+  for (const runtime of installed) {
+    const version = await runtimeVersion(runtime)
+    console.log(`\n${runtime.name}  [${runtime.id}]  ${version || "version unknown"}`)
+
+    for (const profile of [DEFAULT_PROFILE, ...listProfiles(runtime)]) {
+      const slug = profile.slug || "default"
+      const scan = scanned.find((p) => p.runtime === runtime.id && p.slug === slug)
+      const status = scan?.status || "unknown"
+      const mark = status === "ready" ? "✓" : status === "logged_out" ? "✗" : "?"
+
+      console.log(`  ${mark} ${profile.label}  [${slug}]${status === "ready" ? "" : `  — ${status.replace(/_/g, " ")}`}`)
+      console.log(`      account:   ${scan?.account_email || scan?.account_hint || "couldn't tell — see below"}`)
+      console.log(`      folder:    ${profile.slug
+        ? profileDir(runtime, profile.slug)
+        : `this machine's own ${runtime.name} login (no ${runtime.configDirEnvVar || "config-dir"} override)`}`)
+
+      if (credentials === null) {
+        console.log("      provider:  couldn't ask Configure My AI just now")
+      } else {
+        // The server calls the ambient login "default"; locally it is the
+        // empty slug, so a provider on the default login has a blank one.
+        const mine = credentials.filter((c) =>
+          (c.profile || "default") === slug && (!c.runtime || c.runtime === runtime.id))
+        console.log(`      provider:  ${mine.length ? mine.map((c) => `"${c.name}"`).join(", ") : "none yet — it appears on its own once the login is reported"}`)
+      }
+    }
+  }
+
+  console.log("\nConfirming which plan pays")
+  console.log("  1. The account above is read from the login's own config directory,")
+  console.log("     not from the label — so it is what the CLI will actually sign in as.")
+  console.log("  2. `cma-agent start` prints the same account on the line that opens")
+  console.log("     every run: → Claude Code (account: you@acme.com): claude-opus-5 …")
+  console.log("  3. The web app shows it too, in the first line of a session's thinking log.")
+  console.log("  4. Anthropic's own record is the last word: check claude.ai/settings/usage")
+  console.log("     while signed in as that account.")
+
+  const unknown = scanned.filter((p) => !p.account_email && !p.account_hint)
+  if (unknown.length > 0) {
+    console.log("\nA login with no account shown is one whose config directory has no")
+    console.log("account in it yet — sign it in, then run this again:")
+    for (const p of unknown) {
+      console.log(`  cma-agent runtimes:login --runtime ${p.runtime}${p.slug === "default" ? "" : ` --profile ${p.slug}`}`)
+    }
+  }
+
+  // Two labels, one account, and nothing on screen saying so is the failure
+  // this command exists to catch — see the Keychain note on the Claude Code
+  // adapter. Named loudly rather than left to be inferred from two identical
+  // lines twenty rows apart.
+  for (const clash of duplicateAccounts(scanned)) {
+    console.log(`\n! These logins resolve to the SAME account (${clash.account}):`)
+    console.log(`    ${clash.profiles.map((p) => `${p.label} [${p.slug}]`).join(", ")}`)
+    console.log("  They all spend that one subscription. On macOS this is usually the Keychain:")
+    console.log("  sign the one you want in last, then run `cma-agent runtimes:scan`.")
+  }
+
+  return 0
 }
 
 // A ceiling this machine keeps for itself.
@@ -620,6 +759,10 @@ async function main() {
     case "repos:list": return cmdReposList()
     case "repos:remove": return cmdReposRemove(args)
 
+    case "accounts": return cmdAccounts()
+    case "runtimes:accounts": return cmdAccounts()
+    case "claude:accounts": return cmdAccounts()
+
     case "runtimes:add": return cmdRuntimeAdd(args)
     case "runtimes:login": return cmdRuntimeLogin(args)
     case "runtimes:list": return cmdRuntimeList()
@@ -640,6 +783,7 @@ async function main() {
     // environment. Undocumented in HELP because typing it by hand does nothing
     // useful — it would sit waiting on stdin.
     case "mcp-github": return serveGithubMcp()
+    case "mcp-web": return serveWebMcp()
     case "--version":
     case "version": console.log(VERSION); return 0
     default:

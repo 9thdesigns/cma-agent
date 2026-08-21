@@ -1,7 +1,11 @@
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
+
 import {
-  classifyFailure, emptyUsage, envForGithub, firstKey, FORBIDDEN_GIT, GIT_VERBS,
-  GITHUB_MCP_SERVER, githubMcpServers, locateBin, locationAdvice, normalizeUsage,
-  shortCommand, shortPath
+  classifyFailure, emptyUsage, envForGithub, envForWeb, firstKey, FORBIDDEN_GIT, GIT_VERBS,
+  GITHUB_MCP_SERVER, locateBin, locationAdvice, maskAccount, mcpServersFor, WEB_MCP_SERVER,
+  normalizeUsage, shortCommand, shortPath
 } from "./shared.js"
 
 // ---------------------------------------------------------------------------
@@ -66,14 +70,18 @@ function allowedToolsFor(job) {
   const tools = []
   if (job.workdir) tools.push(...FILE_TOOLS, ...GIT_TOOLS)
   if (job.github?.token) tools.push(`mcp__${GITHUB_MCP_SERVER}`)
+  // The web channel is pre-approved by server name, the same way GitHub is —
+  // this is what makes a headless fetch possible at all: the built-in
+  // WebFetch prompts for a grant nobody is there to give.
+  if (job.web?.token) tools.push(`mcp__${WEB_MCP_SERVER}`)
   return tools
 }
 
 // Inline JSON rather than a temp file — Claude Code is the one runtime of the
 // three that takes MCP configuration as an argument, and an argument leaves
 // nothing behind.
-function mcpConfigFor() {
-  return JSON.stringify({ mcpServers: githubMcpServers() })
+function mcpConfigFor(job) {
+  return JSON.stringify({ mcpServers: mcpServersFor(job) })
 }
 
 // Exported so the argument list a repository turn actually runs with can be
@@ -92,7 +100,7 @@ export function baseArgs(job) {
   // them, with or without a checkout: a session with no working tree still
   // can't push code, but it can open, edit, comment on and merge pull
   // requests, and being unable to do that was the original complaint.
-  if (job.github?.token) args.push(...CLI.mcpConfig(mcpConfigFor()))
+  if (job.github?.token || job.web?.token) args.push(...CLI.mcpConfig(mcpConfigFor(job)))
 
   const allowed = allowedToolsFor(job)
   if (allowed.length > 0) {
@@ -297,6 +305,83 @@ function parseBuffered(stdout) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Which Claude account a login actually resolves to.
+//
+// Two logins on one machine are only useful if you can tell them apart, and
+// "which subscription just paid for that?" is not a question a label can
+// answer — a label is what you typed, not what the CLI resolved. On macOS in
+// particular the credential lives in the Keychain rather than in the
+// per-profile directory, so two profiles CAN collapse into one account while
+// their labels keep insisting otherwise. That failure is silent, it bills the
+// wrong plan, and reading the account back is the only thing that catches it.
+//
+// What we read is deliberately narrow. `.claude.json` is Claude Code's own
+// settings file and sits BESIDE the credential rather than holding it: the
+// only keys touched here are the account's address and its org/account ids.
+// Nothing in this file reads a token, and nothing here writes to the profile
+// directory — the separation is still the security property.
+// ---------------------------------------------------------------------------
+
+// Claude Code keeps `.claude.json` at the root of its config directory, which
+// is CLAUDE_CONFIG_DIR when set and the home directory otherwise. The XDG path
+// is checked too because some builds honour it; a machine that has neither
+// simply has no account to report, which is a fine answer.
+function accountFilesFor(configDir) {
+  const home = os.homedir()
+  const dirs = configDir
+    ? [configDir]
+    : [process.env.CLAUDE_CONFIG_DIR, home, path.join(process.env.XDG_CONFIG_HOME || path.join(home, ".config"), "claude")]
+
+  return dirs.filter(Boolean).map((dir) => path.join(dir, ".claude.json"))
+}
+
+// Pulled out so the parsing can be tested without a home directory to stage.
+export function accountFromSettings(parsed) {
+  const oauth = parsed?.oauthAccount
+  const email = String(oauth?.emailAddress || "").trim()
+  if (!email) return null
+
+  return {
+    email,
+    // Two work accounts at the same company share a domain, so the org id is
+    // what actually distinguishes them. Ids only — never a name we'd have to
+    // keep in step with, and never anything that authenticates.
+    organizationUuid: String(oauth.organizationUuid || "").trim() || null,
+    accountUuid: String(oauth.accountUuid || "").trim() || null,
+    source: "oauth"
+  }
+}
+
+// `configDir` is the profile's CLAUDE_CONFIG_DIR, or null for the ambient
+// login. Returns null rather than throwing for every "we couldn't tell":
+// not knowing the account is a worse report than no report, but it is not a
+// failure of the run, and a login that works must never be held back by it.
+export function readAccount({ configDir = null } = {}) {
+  for (const file of accountFilesFor(configDir)) {
+    try {
+      const account = accountFromSettings(JSON.parse(fs.readFileSync(file, "utf8")))
+      if (account) return account
+    } catch {
+      // Missing, unreadable or not JSON — try the next candidate.
+    }
+  }
+
+  // An API key is a different kind of login and worth saying so: it spends
+  // per-token billing rather than a Claude plan, which is exactly the mix-up
+  // this whole feature exists to prevent.
+  if (process.env.ANTHROPIC_API_KEY) return { email: null, source: "api_key" }
+
+  return null
+}
+
+// One short line for a terminal or a thinking log: "account: you@acme.com".
+export function describeAccount(account) {
+  if (!account) return null
+  if (account.source === "api_key") return "account: an Anthropic API key"
+  return account.email ? `account: ${account.email}` : null
+}
+
 export const claudeCode = {
   id: "claude_code",
   name: "Claude Code",
@@ -319,6 +404,12 @@ export const claudeCode = {
   configDirEnvVar: "CLAUDE_CONFIG_DIR",
   profilesDirName: "claude-profiles",
 
+  // "Which account is this?", answered by reading Claude Code's own settings
+  // file rather than by trusting the label. See readAccount above.
+  readAccount,
+  describeAccount,
+  maskAccount,
+
   versionArgs: ["--version"],
   loginArgs: () => ["/login"],
   loginHint: "cma-agent runtimes:login --runtime claude_code",
@@ -334,7 +425,7 @@ export const claudeCode = {
 
   streamingArgs,
   bufferedArgs,
-  envFor: (job) => envForGithub(job),
+  envFor: (job) => ({ ...envForGithub(job), ...envForWeb(job) }),
   describeEvent,
   collapseEvents,
   partialTextFrom,

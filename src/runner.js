@@ -3,8 +3,10 @@ import os from "node:os"
 import * as api from "./api.js"
 import { readConfig } from "./config.js"
 import { runCompletion } from "./engine.js"
-import { scanProfiles, resolveSlug, runtimeVersions } from "./profiles.js"
-import { getRuntime, installedRuntimes, RUNTIMES } from "./runtimes/index.js"
+import {
+  DEFAULT_PROFILE, describeAccount, listProfiles, resolveSlug, runtimeModels, runtimeVersions, scanProfiles
+} from "./profiles.js"
+import { getRuntime, installedRuntimes, isInstalled, RUNTIMES } from "./runtimes/index.js"
 import { resolveRepo, runCommand, COMMANDS } from "./repos.js"
 import { VERSION } from "./version.js"
 
@@ -84,6 +86,11 @@ export async function start({ log = console.log } = {}) {
   }
 
   const versions = await runtimeVersions()
+  // What this machine can run that the server could not have known — the
+  // models somebody pulled themselves. Refreshed on every rescan below, so
+  // `ollama pull` shows up in the web app's picker within ten minutes without
+  // anyone restarting anything.
+  let models = await runtimeModels()
 
   // Say it even on success: a service started by launchd will be running the
   // copy we resolved, not whatever the user's terminal finds, and the two
@@ -96,6 +103,15 @@ export async function start({ log = console.log } = {}) {
   const summary = installed.map((r) => `${r.name} ${versions[r.id] || "?"}`).join(" · ")
   log(`cma-agent ${VERSION} · ${summary}`)
   log(`Host: ${os.hostname()}`)
+
+  // Which accounts this process is holding, before it runs anything on them.
+  //
+  // The label is what someone typed months ago; the account is what the CLI
+  // resolves right now, and the whole point of two logins is that spending the
+  // wrong subscription must not be a thing you discover from a bill. Printed
+  // from files rather than probes so startup stays instant — `cma-agent
+  // accounts` is the same picture with the sign-in state checked.
+  logAccounts(installed, log)
 
   let running = true
   const stop = () => {
@@ -113,7 +129,9 @@ export async function start({ log = console.log } = {}) {
 
   const beat = async () => {
     try {
-      const data = await api.heartbeat({ agentVersion: VERSION, runtimeVersions: versions })
+      const data = await api.heartbeat({
+        agentVersion: VERSION, runtimeVersions: versions, runtimeModels: models
+      })
       applySettings(data?.device, limits, log)
     } catch (error) {
       if (error.status === 409) {
@@ -127,7 +145,11 @@ export async function start({ log = console.log } = {}) {
 
   const rescan = async () => {
     try {
-      await api.syncProfiles(await scanProfiles())
+      const profiles = await scanProfiles()
+      // Re-read rather than reuse: a model pulled since startup is the whole
+      // reason this runs on a timer, and the list is two lines of JSON.
+      models = await runtimeModels()
+      await api.syncProfiles(profiles, models)
     } catch (_error) {
       // Nothing to do about a failed scan report — the next one will carry it.
     }
@@ -254,6 +276,22 @@ function prefixed(log, job, limit) {
   return (message) => log(`[${tag}] ${message}`)
 }
 
+// Every login this machine holds, and the account each one resolves to.
+//
+// Reads files only — no probe, no spawn — so it costs nothing at startup and
+// can never delay the first job. A login whose account we cannot read still
+// prints: "we can't tell" is a real state and hiding it would make an empty
+// line look like a missing login.
+function logAccounts(runtimes, log) {
+  for (const runtime of runtimes) {
+    for (const profile of [DEFAULT_PROFILE, ...listProfiles(runtime)]) {
+      const account = describeAccount(runtime, profile.slug, profile)
+      const slug = profile.slug || "default"
+      log(`  · ${runtime.name} · ${profile.label} [${slug}] — ${account || "account unknown"}`)
+    }
+  }
+}
+
 async function handleJob(job, log) {
   const started = Date.now()
 
@@ -285,7 +323,7 @@ async function handleJob(job, log) {
   // Two different failures, two different messages: "update the companion" and
   // "install the CLI" send someone to opposite places.
   const runtime = job.runtime ? getRuntime(job.runtime) : getRuntime(null)
-  if (!runtime || !runtime.resolveBin().bin) {
+  if (!runtime || !isInstalled(runtime)) {
     const message = runtime
       ? `${runtime.name} isn't installed on this machine. Install it from ${runtime.install}, then run \`cma-agent runtimes:scan\`.`
       : `This companion can't drive "${job.runtime}". Update cma-agent, or point that provider at a different runtime.`
@@ -319,9 +357,17 @@ async function handleJob(job, log) {
     }
   }
 
+  // Which account is about to be spent, on the line that opens the run.
+  //
+  // "Claude Code: claude-opus-5 on \"9th\"" named the login's LABEL, which is
+  // the one fact here nobody can be wrong about and the one that says nothing
+  // about which subscription pays. The account resolved from the profile's own
+  // config directory is the answer to "did that just come out of work or
+  // personal", and it belongs where you are already looking.
+  const account = describeAccount(runtime, resolveSlug(job.profile_slug))
   log(
-    `→ ${runtime.name}: ${job.model || "default model"} on "${job.profile_slug || "default"}"` +
-    `${workdir ? ` in ${workdir}` : ""}…`
+    `→ ${runtime.name}${account ? ` (${account})` : ""}: ${job.model || "default model"} ` +
+    `on "${job.profile_slug || "default"}"${workdir ? ` in ${workdir}` : ""}…`
   )
 
   try {
