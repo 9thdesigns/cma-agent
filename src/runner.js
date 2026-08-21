@@ -4,7 +4,8 @@ import * as api from "./api.js"
 import { readConfig } from "./config.js"
 import { runCompletion } from "./engine.js"
 import {
-  DEFAULT_PROFILE, describeAccount, listProfiles, resolveSlug, runtimeModels, runtimeVersions, scanProfiles
+  DEFAULT_PROFILE, defaultProfileSlug, describeAccount, listProfiles, resolveSlug, runtimeModels,
+  runtimeVersions, scanProfiles
 } from "./profiles.js"
 import { getRuntime, installedRuntimes, isInstalled, RUNTIMES } from "./runtimes/index.js"
 import { resolveRepo, runCommand, COMMANDS } from "./repos.js"
@@ -284,10 +285,20 @@ function prefixed(log, job, limit) {
 // line look like a missing login.
 function logAccounts(runtimes, log) {
   for (const runtime of runtimes) {
+    const preferred = defaultProfileSlug(runtime)
+
     for (const profile of [DEFAULT_PROFILE, ...listProfiles(runtime)]) {
-      const account = describeAccount(runtime, profile.slug, profile)
       const slug = profile.slug || "default"
-      log(`  · ${runtime.name} · ${profile.label} [${slug}] — ${account || "account unknown"}`)
+      // The ambient row reports where "default" actually lands, so the account
+      // beside it is the account a run will spend rather than the one that
+      // happens to be signed in.
+      const account = describeAccount(runtime, profile.slug || preferred, profile.slug ? profile : null)
+      const mark = (profile.slug || "") === preferred ? "  ← work with no login named lands here" : ""
+      log(`  · ${runtime.name} · ${profile.label} [${slug}] — ${account || "account unknown"}${mark}`)
+    }
+
+    if (!preferred && listProfiles(runtime).length > 0) {
+      log(`    (\`cma-agent use <login>\` sends unnamed work to one of the others)`)
     }
   }
 }
@@ -364,15 +375,22 @@ async function handleJob(job, log) {
   // about which subscription pays. The account resolved from the profile's own
   // config directory is the answer to "did that just come out of work or
   // personal", and it belongs where you are already looking.
-  const account = describeAccount(runtime, resolveSlug(job.profile_slug))
+  const slug = resolveSlug(job.profile_slug, runtime)
+  const account = describeAccount(runtime, slug)
+  // When "default" has been pointed somewhere by `cma-agent use`, say so on
+  // this line rather than only in the account. Someone reading their own
+  // terminal should not have to know the redirect exists to understand why a
+  // run the web app labelled "default" spent the other subscription.
+  const asked = job.profile_slug || "default"
+  const routed = slug && slug !== asked ? `"${asked}" → "${slug}"` : `"${asked}"`
   log(
     `→ ${runtime.name}${account ? ` (${account})` : ""}: ${job.model || "default model"} ` +
-    `on "${job.profile_slug || "default"}"${workdir ? ` in ${workdir}` : ""}…`
+    `on ${routed}${workdir ? ` in ${workdir}` : ""}…`
   )
 
   try {
     const output = await runCompletion(
-      { ...job, runtime: runtime.id, workdir, profileSlug: resolveSlug(job.profile_slug) },
+      { ...job, runtime: runtime.id, workdir, profileSlug: slug },
       {
         // Two jobs at once: keep the server's wait alive, and give the person
         // watching the web app the same running ticker they would see in a

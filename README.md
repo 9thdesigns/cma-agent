@@ -111,8 +111,39 @@ resolve the short form `9thdesigns/tap`. (An earlier version of these docs said
 
 ```sh
 bin/release-agent --dry-run   # render everything, push nothing
-bin/release-agent             # publish
+bin/release-agent             # publish, then announce
 ```
+
+#### Announcing
+
+Publishing and announcing are two halves of one release, and `bin/release-agent`
+runs both. The second half is the one that kept going missing: a tag would land,
+nobody would be told, `package.json` would move on, and no later deploy would
+ever look back — 0.11.1 shipped in silence exactly that way.
+
+So after publishing, the script runs the announcement on the app itself:
+
+```sh
+heroku run --exit-code --app configure-my-ai -- bundle exec rails agent:release:announce_pending
+```
+
+`--exit-code` is load-bearing. Without it `heroku run` exits 0 no matter what
+the dyno did, and a refused announcement would read as a delivered one.
+
+Everything that could stop it is checked **before** anything is pushed — the
+Heroku CLI being absent, not being logged in, the app not being one you can see
+— because finding out afterwards leaves a version people can install and nobody
+knows about. Each failure names the command that fixes it.
+
+Running the script again on a version that is already published is not a no-op:
+it still asks, so a release that was published but never announced gets its
+notification. `announce_pending` sends nothing when there is nothing pending.
+
+| Flag | Why |
+| --- | --- |
+| `--no-announce` | publish quietly; also `CMA_ANNOUNCE=0` |
+| `--app NAME` | a Heroku app other than `configure-my-ai`; also `CMA_HEROKU_APP` |
+| `--dry-run` | renders a formula and never announces |
 
 Then set these on the web app so the walkthrough and docs stop telling people to
 build from source:
@@ -176,6 +207,56 @@ used for authentication.
 
 Both labels then appear in the **Claude login** picker when you create a
 provider in the web app.
+
+### Choosing which account runs the work
+
+There are two levels, and they answer different questions.
+
+**The web app decides per provider, and it wins.** Every usable login becomes
+its own provider — `Claude Code · Work`, `Claude Code · 9th` — so pointing a
+configuration at an account is the same action as switching from Anthropic to
+OpenAI. Pick the provider. Nothing on this machine overrides that.
+
+**This machine decides what "no login named" means.** A provider can also leave
+the login blank, which every provider does that was created before a second
+login existed. Blank has always meant the ambient login — whichever account the
+vendor CLI happens to be signed into — which is right with one account and a
+coin toss with two. `use` makes it a choice:
+
+```sh
+cma-agent use            # what it is now, and what each alternative would spend
+cma-agent use 9th        # send unnamed work to that login instead
+cma-agent use default    # back to this machine's ambient login
+```
+
+```
+$ cma-agent use 9th
+✓ Claude Code: work that names no login now runs on
+    9th [9th] — account: ds@davidos.us
+    Told Configure My AI, so the web app shows the same account.
+
+Restart the companion for it to take effect: cma-agent start
+```
+
+Restarting matters: `start` reads this once, and the banner it prints marks the
+login unnamed work lands on. Per runtime, so `use --runtime cursor` is a
+separate decision — "work" under Claude Code and "work" under Cursor are
+different logins that share a word.
+
+Choosing a login that has since been deleted falls back to ambient rather than
+running against a directory with no credential in it.
+
+**It is reported, not hidden.** The account this redirect lands on is what gets
+sent to the web app for that provider, and the line opening each run shows the
+hop:
+
+```
+→ Claude Code (account: ds@davidos.us): claude-opus-5 on "default" → "9th"…
+```
+
+That is deliberate. The web app tells you which account a run spent; a machine
+that quietly sent work elsewhere while still reporting the ambient address
+would turn that into a lie.
 
 ### Which account is this, really?
 
@@ -352,6 +433,7 @@ distinguish a long run from a dead one — buffering emits nothing until the end
 | `repos:add PATH` | Share a folder so the web app can see the repositories in it |
 | `repos:list` | Show shared folders and the repositories found |
 | `repos:remove PATH` | Stop sharing a folder |
+| `use [login]` | Which login work runs on when nothing names one. No argument shows it |
 | `accounts` | Which account each login signs in as, and the provider that spends it |
 | `runtimes:list` | Show every runtime and the logins on this machine |
 | `runtimes:add --runtime R --label X` | Add a separate login and sign into it |
