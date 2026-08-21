@@ -111,8 +111,18 @@ export async function scanProfiles() {
 
   for (const runtime of installedRuntimes()) {
     for (const profile of [DEFAULT_PROFILE, ...listProfiles(runtime)]) {
-      const probe = await probeProfile(runtime, profile.slug)
-      const account = accountFor(runtime, profile.slug, profile)
+      // Probe and report where the login will ACTUALLY run. For every login
+      // but the ambient one that is itself; for the ambient one it is whatever
+      // `cma-agent use` pointed "default" at.
+      //
+      // This is the whole reason the redirect is safe to have. The web app
+      // says which account a run spent, and it says it from what is reported
+      // here — so a machine that quietly sent "default" somewhere else while
+      // still reporting the ambient address would turn that display into a
+      // lie. Report the destination and it stays true.
+      const target = profile.slug || defaultProfileSlug(runtime)
+      const probe = await probeProfile(runtime, target)
+      const account = accountFor(runtime, target)
       report.push({
         runtime: runtime.id,
         slug: profile.slug || "default",
@@ -173,11 +183,73 @@ export async function runtimeModels() {
   return models
 }
 
+// ---------------------------------------------------------------------------
+// Which login "the machine's default" means.
+//
+// A provider in the web app either names a login or leaves it blank, and blank
+// has always meant the ambient one — whatever the vendor CLI is signed into
+// when nobody overrides its config directory. On a machine with one account
+// that is exactly right. On a machine with two it is a coin toss you did not
+// call: someone with work signed in ambiently and a personal login beside it
+// gets work for every provider that was created before the second login
+// existed, with nothing in the terminal to change it.
+//
+// So the ambient meaning becomes a choice. `cma-agent use 9th` records it;
+// everything that arrives asking for "default" resolves there instead.
+//
+// A provider that NAMES a login still wins. This only decides what blank
+// means, so choosing in the web app keeps working exactly as documented and
+// the two can never disagree — there is nothing to disagree about.
+//
+// Stored per runtime because slugs are per runtime: "work" under Claude Code
+// and "work" under Cursor are different logins that happen to share a word.
+export function defaultProfileSlug(runtime) {
+  const configured = (readConfig().default_profiles || {})[runtimeIdOf(runtime)]
+  if (!configured || configured === "default") return ""
+
+  // A default pointing at a login that has since been removed is worse than no
+  // default at all: it would send every run to a directory with no credential
+  // in it. Fall back to ambient, which is what it meant before.
+  const exists = listProfiles(runtime).some((p) => p.slug === configured)
+  return exists ? configured : ""
+}
+
+export function setDefaultProfile(runtimeId, slug) {
+  const runtime = getRuntime(runtimeId)
+  if (!runtime) throw new Error(`Unknown runtime "${runtimeId}".`)
+
+  const wanted = String(slug || "").trim()
+  const defaults = { ...(readConfig().default_profiles || {}) }
+
+  if (!wanted || wanted === "default") {
+    delete defaults[runtime.id]
+    writeConfig({ default_profiles: defaults })
+    return ""
+  }
+
+  if (!listProfiles(runtime).some((p) => p.slug === wanted)) {
+    const known = listProfiles(runtime).map((p) => p.slug)
+    throw new Error(
+      `No ${runtime.name} login called "${wanted}" on this machine.` +
+      (known.length ? ` Try: ${["default", ...known].join(", ")}` : "") +
+      "\nRun `cma-agent accounts` to see what is here."
+    )
+  }
+
+  defaults[runtime.id] = wanted
+  writeConfig({ default_profiles: defaults })
+  return wanted
+}
+
 // The server addresses the ambient login as "default"; locally it is the empty
 // slug, because empty means "set no config-directory override at all".
-export function resolveSlug(reportedSlug) {
-  if (!reportedSlug || reportedSlug === "default") return ""
-  return reportedSlug
+export function resolveSlug(reportedSlug, runtime = DEFAULT_RUNTIME) {
+  // An explicitly named login is the server's decision and is honoured as-is.
+  if (reportedSlug && reportedSlug !== "default") return reportedSlug
+
+  // Blank means "the machine's default", which is the ambient login unless
+  // this machine has been told otherwise.
+  return defaultProfileSlug(runtime)
 }
 
 // ---------------------------------------------------------------------------

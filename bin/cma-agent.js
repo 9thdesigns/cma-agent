@@ -9,8 +9,8 @@ import { readConfig, writeConfig, serverUrl, deviceToken, profileDir } from "../
 import { serve as serveGithubMcp } from "../src/mcp.js"
 import { serve as serveWebMcp } from "../src/mcp_web.js"
 import {
-  addProfile, duplicateAccounts, listProfiles, removeProfile, scanProfiles, runtimeModels,
-  runtimeVersions,
+  addProfile, defaultProfileSlug, describeAccount, duplicateAccounts, listProfiles, removeProfile,
+  scanProfiles, runtimeModels, runtimeVersions, setDefaultProfile,
   DEFAULT_PROFILE, DEFAULT_RUNTIME
 } from "../src/profiles.js"
 import { getRuntime, installedRuntimes, isInstalled, RUNTIMES } from "../src/runtimes/index.js"
@@ -46,6 +46,9 @@ Local repositories
   repos:remove ~/code           Stop sharing a folder
 
 Logins
+  use                           Show which login work with no login named runs on
+  use 9th                       Send it to that login instead
+  use default                   Put it back to this machine's ambient login
   accounts                      Show which account each login actually signs in
                                   as, and which provider in the web app spends it
   runtimes:list                 Show every runtime and the logins on this machine
@@ -616,6 +619,82 @@ function printProfiles(profiles, indent = "") {
 // sign-in still works, and names the provider in the web app that spends it,
 // so all three facts are on one screen instead of in three places.
 // ---------------------------------------------------------------------------
+// Which login does work run on when nothing names one?
+//
+// The web app is where a provider is pointed at a specific login, and that is
+// unchanged and still wins — see the docs. What it could not do is decide what
+// a provider means when it names NO login, which is every provider created
+// before a second login existed. That meaning is this machine's to make, and
+// until now it was made silently: the ambient login, whichever account the
+// vendor CLI happened to be signed into.
+//
+//   cma-agent use          what it is now, and what each choice would spend
+//   cma-agent use 9th      make it that login
+//   cma-agent use default  back to the ambient one
+async function cmdUse(args) {
+  let runtime
+  try {
+    runtime = resolveRuntimeArg(args, { fallback: DEFAULT_RUNTIME })
+  } catch (error) {
+    console.error(`✗ ${error.message}`)
+    return 1
+  }
+
+  const wanted = args._[0]
+  const current = defaultProfileSlug(runtime)
+
+  const describe = (slug) => describeAccount(runtime, slug) || "account unknown"
+  const nameOf = (slug) =>
+    slug ? (listProfiles(runtime).find((p) => p.slug === slug)?.label || slug) : DEFAULT_PROFILE.label
+
+  if (wanted === undefined) {
+    console.log(`${runtime.name}: work that names no login runs on`)
+    console.log(`  ${nameOf(current)} [${current || "default"}] — ${describe(current)}\n`)
+
+    const options = [DEFAULT_PROFILE, ...listProfiles(runtime)]
+    if (options.length === 1) {
+      console.log("This machine has one login, so there is nothing to choose between.")
+      console.log(`Add another with: cma-agent runtimes:add --runtime ${runtime.id} --label "Work"`)
+      return 0
+    }
+
+    console.log("Change it to any of:")
+    for (const profile of options) {
+      const slug = profile.slug || "default"
+      const mark = (profile.slug || "") === current ? "·" : " "
+      console.log(`  ${mark} cma-agent use ${slug}`.padEnd(30) + `${profile.label} — ${describe(profile.slug)}`)
+    }
+    console.log("\nA provider that names a login in the web app is unaffected — this only")
+    console.log("decides what the ones that name none mean.")
+    return 0
+  }
+
+  let slug
+  try {
+    slug = setDefaultProfile(runtime.id, String(wanted))
+  } catch (error) {
+    console.error(`✗ ${error.message}`)
+    return 1
+  }
+
+  console.log(`✓ ${runtime.name}: work that names no login now runs on`)
+  console.log(`    ${nameOf(slug)} [${slug || "default"}] — ${describe(slug)}`)
+
+  // Report it straight away rather than waiting for the next scan, so the web
+  // app agrees about which account that work spends before anyone runs any.
+  if (deviceToken()) {
+    try {
+      await api.syncProfiles(await scanProfiles(), await runtimeModels())
+      console.log("    Told Configure My AI, so the web app shows the same account.")
+    } catch (_error) {
+      console.log("    (Couldn't reach Configure My AI just now — it catches up on the next check-in.)")
+    }
+  }
+
+  console.log("\nRestart the companion for it to take effect: cma-agent start")
+  return 0
+}
+
 async function cmdAccounts() {
   const scanned = await scanProfiles()
 
@@ -759,6 +838,7 @@ async function main() {
     case "repos:list": return cmdReposList()
     case "repos:remove": return cmdReposRemove(args)
 
+    case "use": return cmdUse(args)
     case "accounts": return cmdAccounts()
     case "runtimes:accounts": return cmdAccounts()
     case "claude:accounts": return cmdAccounts()
