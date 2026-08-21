@@ -261,3 +261,46 @@ export function githubMcpServers() {
     [GITHUB_MCP_SERVER]: { command: process.execPath, args: [selfPath(), "mcp-github"] }
   }
 }
+
+// The MCP server carrying the app's web access — fetch, browse, search, all
+// run server-side with no permission prompt. Same shape as the GitHub server
+// for the same reasons.
+export const WEB_MCP_SERVER = "cma_web"
+
+export function envForWeb(job) {
+  if (!job.web?.token) return {}
+
+  return {
+    CMA_WEB_ENDPOINT: String(job.web.endpoint || ""),
+    CMA_WEB_TOKEN: String(job.web.token)
+  }
+}
+
+// Every server this job has credentials for, in one map — what both MCP
+// config shapes (Claude Code's inline argument, Cursor's file) actually want.
+// Gated per server: a job with GitHub credentials and no web grant mounts
+// exactly what it can use, and vice versa.
+export function mcpServersFor(job) {
+  const servers = {}
+  if (job.github?.token) Object.assign(servers, githubMcpServers())
+  if (job.web?.token) {
+    servers[WEB_MCP_SERVER] = { command: process.execPath, args: [selfPath(), "mcp-web"] }
+  }
+  return servers
+}
+
+// ---------------------------------------------------------------------------
+// Masking an account address.
+//
+// Shared because every runtime that can name its login has the same question
+// to answer, and because the shape has to be stable: it is what the web app
+// falls back to when someone has asked us not to send the address itself.
+// ---------------------------------------------------------------------------
+export function maskAccount(value) {
+  const text = String(value || "").trim()
+  if (!text) return null
+
+  const [user, domain] = text.split("@")
+  if (!domain) return `${text.slice(0, 1)}•••`
+  return `${user.slice(0, 1)}•••@${domain}`
+}

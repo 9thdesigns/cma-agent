@@ -2,7 +2,7 @@ import { spawn } from "node:child_process"
 
 import { ensureProfileDir } from "./config.js"
 import { collectDocuments } from "./documents.js"
-import { DEFAULT_RUNTIME, getRuntime } from "./runtimes/index.js"
+import { DEFAULT_RUNTIME, getRuntime, isHttpRuntime, isInstalled } from "./runtimes/index.js"
 
 // ---------------------------------------------------------------------------
 // The part of running a coding CLI that is the same whatever the vendor.
@@ -11,6 +11,17 @@ import { DEFAULT_RUNTIME, getRuntime } from "./runtimes/index.js"
 // text accumulation, the cancel path. Everything vendor-specific — flags,
 // event shapes, permissions, login — lives in src/runtimes/<name>.js, and this
 // file never names one.
+//
+// ── Two transports, one contract ──────────────────────────────────────────
+//
+// Most runtimes are a subprocess: spawn it, read NDJSON off stdout, kill it to
+// cancel. One (Ollama) is an HTTP endpoint on the same machine: POST, read
+// NDJSON off the response body, abort to cancel. The difference is confined to
+// `runStreaming` vs `runStreamingHttp`, which resolve to the SAME result shape
+// — events, exit code, stderr, why it ended — so every line after the call
+// site is transport-blind. That is deliberate: the idle watchdog, the
+// heartbeat, partial text and cancellation are the hard parts, and there is no
+// version of this file where they exist twice.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -144,7 +155,7 @@ function runStreaming(bin, args, { env = {}, cwd, input, onEvent, onTick, contro
     let idleOut = false
     let overran = false
     let killed = false
-    let badLines = 0
+    const counters = { badLines: 0 }
 
     if (control) {
       control.kill = () => {
@@ -175,7 +186,7 @@ function runStreaming(bin, args, { env = {}, cwd, input, onEvent, onTick, contro
       clearInterval(watchdog)
       if (heartbeat) clearInterval(heartbeat)
       resolve({
-        code, events, stderr, badLines, idleOut, overran, killed, spawnError,
+        code, events, stderr, badLines: counters.badLines, idleOut, overran, killed, spawnError,
         elapsedMs: Date.now() - startedAt
       })
     }
@@ -187,20 +198,9 @@ function runStreaming(bin, args, { env = {}, cwd, input, onEvent, onTick, contro
       // the buffer until its newline arrives.
       let newline
       while ((newline = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, newline).trim()
+        const line = buffer.slice(0, newline)
         buffer = buffer.slice(newline + 1)
-        if (!line) continue
-        try {
-          const event = JSON.parse(line)
-          events.push(event)
-          if (onEvent) {
-            // A throwing callback is the caller's problem, not a reason to
-            // abandon a run that is going fine.
-            try { onEvent(event) } catch { /* ignore */ }
-          }
-        } catch {
-          badLines += 1
-        }
+        consumeLine(line, { events, onEvent, counters })
       }
     })
 
@@ -211,6 +211,173 @@ function runStreaming(bin, args, { env = {}, cwd, input, onEvent, onTick, contro
 
     child.on("error", (error) => finish(-1, error))
     child.on("close", (code) => finish(code))
+  })
+}
+
+// One NDJSON line, parsed and dispatched. Shared by both transports so a
+// malformed line is counted the same way whether it came off a pipe or a
+// socket — `badLines` is what tells "the CLI printed a banner" apart from "the
+// CLI printed nothing".
+function consumeLine(line, { events, onEvent, counters }) {
+  const trimmed = line.trim()
+  if (!trimmed) return
+
+  try {
+    const event = JSON.parse(trimmed)
+    events.push(event)
+    if (onEvent) {
+      // A throwing callback is the caller's problem, not a reason to abandon
+      // a run that is going fine.
+      try { onEvent(event) } catch { /* ignore */ }
+    }
+  } catch {
+    counters.badLines += 1
+  }
+}
+
+// The HTTP twin of runStreaming.
+//
+// Same promise, same resolved shape, same three ways to end: idle too long,
+// ran past the ceiling, or killed on purpose. `code` is 0 or 1 rather than a
+// real exit status because there is no process — what matters downstream is
+// only whether the runtime finished cleanly, and every adapter reads its own
+// events for the actual outcome.
+//
+// A non-2xx response is not thrown: the body is the runtime's own error text
+// ({"error":"model 'x' not found"}), and reporting that beats reporting the
+// status code it arrived under. It lands in `stderr`, which is exactly where
+// the CLI path puts the same information.
+function runStreamingHttp(request, { onEvent, onTick, control } = {}) {
+  return new Promise((resolve) => {
+    const events = []
+    const counters = { badLines: 0 }
+    const startedAt = Date.now()
+    const controller = new AbortController()
+
+    let lastActivity = Date.now()
+    let idleOut = false
+    let overran = false
+    let killed = false
+    let noAnswer = false
+    let stderr = ""
+    let settled = false
+
+    if (control) {
+      control.kill = () => {
+        killed = true
+        controller.abort()
+      }
+    }
+
+    const watchdog = setInterval(() => {
+      const now = Date.now()
+      if (now - lastActivity > IDLE_TIMEOUT_MS) {
+        idleOut = true
+        controller.abort()
+      } else if (now - startedAt > MAX_RUN_MS) {
+        overran = true
+        controller.abort()
+      }
+    }, 1000)
+
+    // Independent of events, for the same reason it is on the CLI path: the
+    // server is waiting on liveness, and a model that is still loading its
+    // weights produces nothing for a minute while being perfectly alive.
+    const heartbeat = onTick
+      ? setInterval(() => { try { onTick() } catch { /* ignore */ } }, HEARTBEAT_EVERY_MS)
+      : null
+
+    const finish = (code, spawnError) => {
+      if (settled) return
+      settled = true
+      clearInterval(watchdog)
+      if (heartbeat) clearInterval(heartbeat)
+      resolve({
+        code, events, stderr, badLines: counters.badLines,
+        idleOut, overran, killed, spawnError,
+        elapsedMs: Date.now() - startedAt
+      })
+    }
+
+    // The connect timeout covers ONLY the round trip to response headers — it
+    // is cleared the moment fetch settles, below. It must not outlive that: a
+    // large model can take a minute to produce its first token, and a
+    // first-token deadline would kill exactly the runs this feature exists for.
+    // Once headers are in, the idle watchdog owns the clock.
+    const connectTimer = request.connectTimeoutMs
+      ? setTimeout(() => {
+          noAnswer = true
+          controller.abort()
+        }, request.connectTimeoutMs)
+      : null
+
+    ;(async () => {
+      let response
+      try {
+        response = await fetch(request.url, {
+          method: request.method || "POST",
+          headers: request.headers || { "Content-Type": "application/json" },
+          body: request.body === undefined ? undefined : JSON.stringify(request.body),
+          signal: controller.signal
+        })
+      } catch (error) {
+        // An abort here is ours: the watchdog, a cancel, or the connect timer.
+        // Anything else is the machine saying nobody is listening — and the
+        // adapter's classifier turns that into an address and a command.
+        if (killed || idleOut || overran) return finish(1)
+        if (noAnswer) {
+          return finish(-1, new Error(
+            `Nothing answered within ${Math.round(request.connectTimeoutMs / 1000)}s. ECONNREFUSED`
+          ))
+        }
+        return finish(-1, error)
+      } finally {
+        if (connectTimer) clearTimeout(connectTimer)
+      }
+
+      lastActivity = Date.now()
+
+      if (!response.ok) {
+        stderr = (await response.text().catch(() => "")).slice(0, 2000) ||
+                 `The runtime answered ${response.status}.`
+        return finish(1)
+      }
+
+      if (!response.body) {
+        stderr = "The runtime answered with an empty body."
+        return finish(1)
+      }
+
+      const decoder = new TextDecoder()
+      let buffer = ""
+
+      try {
+        for await (const chunk of response.body) {
+          lastActivity = Date.now()
+          buffer += decoder.decode(chunk, { stream: true })
+
+          let newline
+          while ((newline = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, newline)
+            buffer = buffer.slice(newline + 1)
+            consumeLine(line, { events, onEvent, counters })
+          }
+        }
+        // A stream that ends without a trailing newline still has one event in
+        // it, and for a short answer that event is the whole result.
+        consumeLine(buffer, { events, onEvent, counters })
+      } catch (error) {
+        // Aborted mid-answer. Everything already read stays — a cancelled run
+        // still shows the user what it had written by the time they stopped it.
+        if (!(killed || idleOut || overran)) {
+          stderr = String(error?.message || error).slice(0, 500)
+          return finish(1)
+        }
+        return finish(1)
+      }
+
+      finish(0)
+    })()
   })
 }
 
@@ -236,7 +403,33 @@ function configDirFor(runtime, slug) {
   return ensureProfileDir(runtime, slug)
 }
 
+// Which account a login actually resolves to, for the runtimes that can say.
+//
+// The label on a profile is what someone typed; this is what the CLI resolved,
+// and they are different claims. On macOS especially they can disagree without
+// anything looking wrong — see the note on claudeCode.readAccount — so this is
+// the difference between "we think Work pays" and "Work pays".
+//
+// Never fatal. A runtime with no answer, an unreadable file or a build that
+// moved the field all mean "we can't tell", which costs a line of display and
+// nothing else.
+export function profileAccount(runtime, slug) {
+  if (typeof runtime?.readAccount !== "function") return null
+
+  try {
+    return runtime.readAccount({ configDir: configDirFor(runtime, slug) })
+  } catch (_error) {
+    return null
+  }
+}
+
 export async function runtimeVersion(runtime) {
+  // An HTTP runtime knows how to ask its own server. There is no binary whose
+  // `--version` would be the right answer anyway: the CLI on this machine and
+  // the server it talks to can be different builds, and the one doing the work
+  // is the server.
+  if (runtime.version) return runtime.version()
+
   const { bin } = runtime.resolveBin()
   if (!bin) return null
 
@@ -245,9 +438,32 @@ export async function runtimeVersion(runtime) {
   return result.stdout.trim().split("\n")[0] || null
 }
 
+// What this runtime can actually run, when only the machine knows.
+//
+// Every hosted vendor has a catalogue we can hold as a constant. A model the
+// user pulled onto their own disk has no catalogue anywhere but that disk, so
+// the runtime reports it and the server stores it per device. A runtime that
+// doesn't declare `reportsModels` has a curated list and contributes nothing
+// here.
+export async function runtimeModels(runtime) {
+  if (!runtime.reportsModels || typeof runtime.listModels !== "function") return []
+
+  try {
+    return await runtime.listModels()
+  } catch {
+    // A model list we couldn't read is not a reason to fail a scan. The stored
+    // catalogue simply stays as it was until the next one succeeds.
+    return []
+  }
+}
+
 // Is this profile signed in and usable? The cheapest possible real request: if
 // it answers at all, the login works.
 export async function probeProfile(runtime, slug) {
+  // Runtimes with no login have their own idea of "usable" — for Ollama it is
+  // "the server answers and has a model", which no spawn could establish.
+  if (runtime.probe) return runtime.probe(slug)
+
   const { bin } = runtime.resolveBin()
   if (!bin) return { status: "not_installed" }
 
@@ -343,34 +559,19 @@ export function withoutCapabilityFlags(args) {
   return out
 }
 
-export async function runCompletion(job, { onProgress } = {}) {
-  const runtime = getRuntime(job.runtime || DEFAULT_RUNTIME)
-  if (!runtime) {
-    throw new Error(`This companion can't drive "${job.runtime}". Update cma-agent.`)
-  }
-
-  const { bin } = runtime.resolveBin()
-  if (!bin) {
-    throw new Error(`${runtime.name} isn't installed on this machine, or isn't on PATH.`)
-  }
-
-  const conversation = renderConversation(job.messages || [])
-  // Runtimes with no system-prompt flag fold it into the prompt instead. The
-  // ones that have a flag return the conversation untouched.
-  const prompt = runtime.renderPrompt ? runtime.renderPrompt(job, conversation) : conversation
-
-  const configDir = configDirFor(runtime, job.profileSlug)
-  // Adapters that need files on disk (Cursor's permissions and MCP wiring)
-  // write them here, before anything is spawned.
-  if (runtime.prepare && configDir) runtime.prepare(job, { configDir })
-
-  const env = { ...envForProfile(runtime, job.profileSlug), ...runtime.envFor(job) }
-  const args = runtime.streamingArgs(job, runtime.promptOnStdin ? undefined : prompt)
-  const stdin = runtime.promptOnStdin ? prompt : undefined
-
-  // ── Streaming. This is the path that makes a long run survivable: events
-  // arrive continuously, so we can distinguish "still working" from "stopped
-  // responding" instead of guessing a duration.
+// Everything about telling the server what a run is doing, in one place.
+//
+// It has to be one place because the two transports would otherwise each grow
+// their own answer to the same four questions: what is it doing, how much has
+// it written, how do I stop it, and how often may I say so. Those answers are
+// tuned (see MIN_NOTE_INTERVAL_MS and HEARTBEAT_EVERY_MS) and drift between
+// two copies is invisible until a local run stops streaming in the web app.
+//
+// `control` is filled in later by whichever runner is used — with a kill() for
+// a child process, or an abort() for a request. Handed to the caller on every
+// post so it can stop the run the moment the server answers a heartbeat with
+// "this job was cancelled".
+function progressTracker(runtime, onProgress, control) {
   let lastNote = null      // the newest thing we know it is doing
   let postedNote = null    // the newest thing we have told the server
   let lastPost = 0
@@ -382,10 +583,6 @@ export async function runCompletion(job, { onProgress } = {}) {
   // exists somewhere other than this machine. See documents.js.
   const written = new Set()
 
-  // Filled in by runStreaming with a kill() for the running child. Passed to
-  // the caller on every progress post so it can stop the run the moment the
-  // server answers a heartbeat with "this job was cancelled".
-  const control = {}
   const cancel = () => { try { control.kill?.() } catch { /* already gone */ } }
 
   // `repeat` distinguishes the two reasons we post. A note the server has
@@ -404,14 +601,13 @@ export async function runCompletion(job, { onProgress } = {}) {
     onProgress(lastNote || "Working", { repeat, partial: partialText || null, cancel })
   }
 
-  const result = await runStreaming(bin, args, {
-    env,
-    cwd: job.workdir,
-    input: stdin,
-    control,
+  return {
+    written,
+
     // Timer-driven: keeps the run alive in the server's eyes even when the
     // model has been silent for minutes inside a single tool call.
     onTick: () => { if (Date.now() - lastPost >= HEARTBEAT_EVERY_MS) post(true) },
+
     onEvent: (event) => {
       const text = runtime.partialTextFrom ? runtime.partialTextFrom(event) : null
       if (text) partialText += text
@@ -436,6 +632,54 @@ export async function runCompletion(job, { onProgress } = {}) {
         post(true)
       }
     }
+  }
+}
+
+export async function runCompletion(job, { onProgress } = {}) {
+  const runtime = getRuntime(job.runtime || DEFAULT_RUNTIME)
+  if (!runtime) {
+    throw new Error(`This companion can't drive "${job.runtime}". Update cma-agent.`)
+  }
+
+  // "Present" is the adapter's question, not this file's: a binary for the
+  // CLIs, a server that answers for Ollama — which may not even be on this
+  // host.
+  if (!isInstalled(runtime)) {
+    throw new Error(`${runtime.name} isn't installed on this machine, or isn't on PATH.`)
+  }
+
+  if (isHttpRuntime(runtime)) return runHttpCompletion(runtime, job, { onProgress })
+
+  const { bin } = runtime.resolveBin()
+
+  const conversation = renderConversation(job.messages || [])
+  // Runtimes with no system-prompt flag fold it into the prompt instead. The
+  // ones that have a flag return the conversation untouched.
+  const prompt = runtime.renderPrompt ? runtime.renderPrompt(job, conversation) : conversation
+
+  const configDir = configDirFor(runtime, job.profileSlug)
+  // Adapters that need files on disk (Cursor's permissions and MCP wiring)
+  // write them here, before anything is spawned.
+  if (runtime.prepare && configDir) runtime.prepare(job, { configDir })
+
+  const env = { ...envForProfile(runtime, job.profileSlug), ...runtime.envFor(job) }
+  const args = runtime.streamingArgs(job, runtime.promptOnStdin ? undefined : prompt)
+  const stdin = runtime.promptOnStdin ? prompt : undefined
+
+  // ── Streaming. This is the path that makes a long run survivable: events
+  // arrive continuously, so we can distinguish "still working" from "stopped
+  // responding" instead of guessing a duration.
+  const control = {}
+  const tracker = progressTracker(runtime, onProgress, control)
+  const written = tracker.written
+
+  const result = await runStreaming(bin, args, {
+    env,
+    cwd: job.workdir,
+    input: stdin,
+    control,
+    onTick: tracker.onTick,
+    onEvent: tracker.onEvent
   })
 
   if (result.spawnError && result.spawnError.code === "ENOENT") {
@@ -494,6 +738,69 @@ export async function runCompletion(job, { onProgress } = {}) {
   // succeeded; a file that cannot be read back is a missing card in the web
   // app, not a failed turn.
   return { ...output, files: safeCollect(job, written) }
+}
+
+// The HTTP path, end to end.
+//
+// Shorter than the CLI path by everything the CLI path exists to survive:
+// there is no argv to have rejected, so no degraded retry; no buffered
+// fallback, because an endpoint that streams has always streamed; and no
+// documents to collect, because a runtime reached this way has no filesystem
+// (see `filesystem: false` on the adapter). What is left is the part that
+// matters — stream it, watch for silence, and read the outcome out of the
+// runtime's own events rather than out of a status code.
+async function runHttpCompletion(runtime, job, { onProgress } = {}) {
+  const control = {}
+  const tracker = progressTracker(runtime, onProgress, control)
+  const request = runtime.buildRequest(job)
+
+  // Where we actually knocked. Threaded into every failure below so a message
+  // that names an address names THIS run's address, rather than whatever the
+  // environment would resolve to by the time the error is built.
+  const at = { url: request.url }
+
+  const result = await runStreamingHttp(request, {
+    control,
+    onTick: tracker.onTick,
+    onEvent: tracker.onEvent
+  })
+
+  if (result.killed) throw new Error("The run was cancelled from the web app.")
+
+  if (result.idleOut) {
+    throw new Error(
+      `${runtime.name} produced no output for ${Math.round(IDLE_TIMEOUT_MS / 1000)}s and was stopped. ` +
+      "The machine may have slept, or the model is genuinely stuck."
+    )
+  }
+  if (result.overran) throw new Error(`${runtime.name} ran past the safety ceiling and was stopped.`)
+
+  // Nothing arrived at all. That is the connection, not the model — and the
+  // adapter's classifier is what turns it into an instruction.
+  if (result.spawnError) {
+    throw runtime.classifyFailure(String(result.spawnError.message || result.spawnError).slice(0, 500), at)
+  }
+
+  const output = runtime.collapseEvents(result.events)
+
+  // An in-band error (a model that isn't pulled, a machine out of memory)
+  // arrives as an event with a 200 around it, so this check is not a fallback
+  // for the status code — it is the primary one.
+  if (output.isError) {
+    throw runtime.classifyFailure(output.errorStatus || output.content || `${runtime.name} reported an error.`, at)
+  }
+
+  if (result.code !== 0 && !output.sawResult) {
+    throw runtime.classifyFailure(
+      (result.stderr || "").trim().slice(0, 500) || `${runtime.name} stopped without finishing.`, at
+    )
+  }
+
+  if (!output.content) throw new Error(`${runtime.name} finished without producing an answer.`)
+
+  // No files, always. Said explicitly rather than left to a falsy default, so
+  // the shape a caller receives is the same one the CLI path returns.
+  return { ...output, files: [] }
 }
 
 function safeCollect(job, written) {

@@ -1,12 +1,13 @@
 import fs from "node:fs"
 
 import { readConfig, writeConfig, profileDir, slugify, ensureDirs } from "./config.js"
-import { probeProfile, runtimeVersion } from "./engine.js"
-import { DEFAULT_RUNTIME, getRuntime, installedRuntimes, RUNTIMES } from "./runtimes/index.js"
+import { probeProfile, profileAccount, runtimeModels as modelsOf, runtimeVersion } from "./engine.js"
+import { maskAccount } from "./runtimes/shared.js"
+import { DEFAULT_RUNTIME, getRuntime, installedRuntimes, isInstalled, RUNTIMES } from "./runtimes/index.js"
 
 // Re-exported so callers that only care about "what does this machine run"
 // don't each import the registry.
-export { DEFAULT_RUNTIME, RUNTIMES, getRuntime, installedRuntimes }
+export { DEFAULT_RUNTIME, RUNTIMES, getRuntime, installedRuntimes, isInstalled }
 
 // A profile is one login for one runtime on this machine, isolated in that
 // runtime's own config directory. The registry below is just our index of them
@@ -111,12 +112,26 @@ export async function scanProfiles() {
   for (const runtime of installedRuntimes()) {
     for (const profile of [DEFAULT_PROFILE, ...listProfiles(runtime)]) {
       const probe = await probeProfile(runtime, profile.slug)
+      const account = accountFor(runtime, profile.slug, profile)
       report.push({
         runtime: runtime.id,
         slug: profile.slug || "default",
         label: profile.label,
         status: probe.status,
-        account_hint: profile.account_hint || null,
+        // Why it is not ready, in the runtime's own words. Carried to the
+        // server because "Ollama is running but has no models pulled" is a
+        // one-command fix, and the web app showing a bare "Unknown" sends
+        // people to check a laptop that is working fine.
+        detail: probe.detail || null,
+        // Which account this login actually resolves to, read back from the
+        // runtime's own settings rather than taken from the label. This is
+        // what lets the web app say "Claude Code (account: you@acme.com)" on
+        // a run instead of leaving you to infer it from a name you chose
+        // months ago. Suppressed to the masked form by
+        // CMA_HIDE_ACCOUNT_EMAIL — see accountFor.
+        account_email: account.email,
+        account_hint: account.hint,
+        account_source: account.source,
         last_verified_at: new Date().toISOString()
       })
     }
@@ -139,6 +154,25 @@ export async function runtimeVersions() {
   return versions
 }
 
+// The models this machine can actually run, for the runtimes where only this
+// machine knows.
+//
+// Every hosted vendor has a catalogue the server can hold. A model somebody
+// pulled onto their own disk does not exist anywhere else, so the picker in
+// the web app is empty unless the machine says what it has. Keyed by runtime
+// and omitted entirely for the runtimes with a curated list, so this map is
+// exactly "what the server could not have known".
+export async function runtimeModels() {
+  const models = {}
+
+  for (const runtime of installedRuntimes()) {
+    const names = await modelsOf(runtime)
+    if (names.length > 0) models[runtime.id] = names
+  }
+
+  return models
+}
+
 // The server addresses the ambient login as "default"; locally it is the empty
 // slug, because empty means "set no config-directory override at all".
 export function resolveSlug(reportedSlug) {
@@ -146,8 +180,76 @@ export function resolveSlug(reportedSlug) {
   return reportedSlug
 }
 
-function maskAccount(value) {
-  const [user, domain] = String(value).split("@")
-  if (!domain) return `${String(value).slice(0, 1)}•••`
-  return `${user.slice(0, 1)}•••@${domain}`
+// ---------------------------------------------------------------------------
+// Which account a login resolves to.
+//
+// Three sources, in order of how much they are worth believing:
+//
+//   1. what the runtime resolved  — read out of its own settings file. The
+//      only one that can catch two profiles collapsing into one account.
+//   2. what you told us           — `runtimes:add --account you@work.com`.
+//      A note to yourself; it cannot be wrong about the label because it IS
+//      the label, and it cannot be right about the account either.
+//   3. nothing                    — an honest answer, and the display says so.
+//
+// CMA_HIDE_ACCOUNT_EMAIL=1 keeps the address on this machine: the masked hint
+// still travels, so the web app can still tell two logins apart, and this
+// machine's own terminal still prints the address in full. What is reported is
+// a choice; what you can see locally is not something we should be deciding.
+// ---------------------------------------------------------------------------
+export function accountFor(runtime, slug, profile = null) {
+  const resolved = profileAccount(runtime, slug)
+  const stored = (profile || listProfiles(runtime).find((p) => p.slug === slug))?.account_hint || null
+
+  if (!resolved) return { email: null, hint: stored, source: stored ? "declared" : null }
+
+  // An API-key login has no address to show, and saying so matters: it spends
+  // per-token billing rather than a Claude plan.
+  if (!resolved.email) return { email: null, hint: null, source: resolved.source || null }
+
+  return {
+    email: hideAccountEmail() ? null : resolved.email,
+    hint: maskAccount(resolved.email),
+    source: resolved.source || null
+  }
+}
+
+// One line for a terminal or a thinking log — "account: you@acme.com" — or
+// null when this machine genuinely cannot tell, because a confident wrong
+// answer here is worse than no answer.
+export function describeAccount(runtime, slug, profile = null) {
+  const account = accountFor(runtime, slug, profile)
+  if (account.source === "api_key") return "account: an Anthropic API key"
+
+  const shown = account.email || account.hint
+  return shown ? `account: ${shown}` : null
+}
+
+// Logins that resolve to the SAME account.
+//
+// The failure this whole feature exists to catch: two labels, one
+// subscription, and nothing on screen saying so. On macOS it happens through
+// the Keychain, which a per-profile config directory does not always isolate
+// — so it is not exotic, it is the default way this goes wrong.
+//
+// Grouped per runtime: a Claude Code login and a Cursor login can legitimately
+// belong to the same person's address without sharing anything at all.
+export function duplicateAccounts(profiles) {
+  const groups = new Map()
+
+  for (const profile of profiles) {
+    const account = profile.account_email || profile.account_hint
+    if (!account) continue
+
+    const key = `${profile.runtime}:${account}`
+    groups.set(key, [...(groups.get(key) || []), profile])
+  }
+
+  return [...groups.entries()]
+    .filter(([, group]) => group.length > 1)
+    .map(([key, group]) => ({ account: key.slice(key.indexOf(":") + 1), profiles: group }))
+}
+
+function hideAccountEmail() {
+  return /^(1|true|yes)$/i.test(String(process.env.CMA_HIDE_ACCOUNT_EMAIL || ""))
 }

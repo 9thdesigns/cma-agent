@@ -2,8 +2,8 @@ import fs from "node:fs"
 import path from "node:path"
 
 import {
-  classifyFailure, emptyUsage, envForGithub, FORBIDDEN_GIT, GIT_VERBS,
-  githubMcpServers, locateBin, locationAdvice, normalizeUsage, shortCommand, shortPath
+  classifyFailure, emptyUsage, envForGithub, envForWeb, FORBIDDEN_GIT, GIT_VERBS,
+  locateBin, locationAdvice, mcpServersFor, normalizeUsage, shortCommand, shortPath
 } from "./shared.js"
 
 // ---------------------------------------------------------------------------
@@ -87,10 +87,11 @@ export function writeConfig(job, configDir) {
   // Only when there is something to connect. A chat completion with no GitHub
   // credentials gets no MCP file at all rather than an empty one.
   const mcpPath = path.join(configDir, "mcp.json")
-  if (job.github?.token) {
+  const servers = mcpServersFor(job)
+  if (Object.keys(servers).length > 0) {
     fs.writeFileSync(
       mcpPath,
-      `${JSON.stringify({ mcpServers: githubMcpServers() }, null, 2)}\n`,
+      `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`,
       { mode: 0o600 }
     )
   } else if (fs.existsSync(mcpPath)) {
@@ -282,7 +283,7 @@ export const cursor = {
 
   streamingArgs,
   renderPrompt,
-  envFor: (job) => envForGithub(job),
+  envFor: (job) => ({ ...envForGithub(job), ...envForWeb(job) }),
 
   // Called before every spawn, with the profile's config directory. This is
   // where the allowance and the MCP wiring land.

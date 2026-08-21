@@ -6,16 +6,41 @@ already pay for instead of an API key.
 
 ## Runtimes
 
-| Runtime | CLI | Plan it spends | Repository turns |
+| Runtime | Reached by | Plan it spends | Repository turns |
 | --- | --- | --- | --- |
 | Claude Code | `claude` | Claude Pro, Max or Team | Edit files, drive git, open PRs |
 | Cursor | `cursor-agent` | Cursor Pro, Ultra or Teams | Edit files, drive git, open PRs |
 | Gemini CLI | `gemini` | Google AI Pro or Ultra | Edit files only — see below |
+| Ollama | `http://127.0.0.1:11434` | Nothing — your own model | None — answers in text only |
 
-Install one or install all three; `cma-agent status` reports what it found and
+Install one or install all four; `cma-agent status` reports what it found and
 what each one can do. A provider in the web app names both the machine and the
 runtime, so a Cursor provider and a Claude Code provider on the same laptop
 spend different subscriptions.
+
+**Ollama is not a subscription, and not a subprocess.** The other three are
+CLIs this companion spawns; Ollama is an HTTP server on the same machine, so
+the adapter hands the engine a request instead of an argv (`transport: "http"`
+in `src/runtimes/ollama.js`). Everything downstream — the silence budget, the
+heartbeat, streamed partial text, cancellation — is shared with the CLI path
+and does not know the difference.
+
+That server listens on `127.0.0.1`, which is exactly why this belongs in the
+companion: the web app cannot reach a loopback address in someone's house, and
+the companion is already standing on the right computer. No tunnel, no port
+forward, nothing exposed.
+
+**Ollama's models are the machine's, not ours.** Every other runtime has a
+catalogue we can hold — the same models on every machine. What Ollama can run
+is whatever its owner pulled, so the companion reports the list on each scan
+and the web app stores it per device. `ollama pull` shows up in the picker
+within about thirty seconds; `ollama rm` removes it.
+
+**What the Ollama runtime cannot do.** It answers with text and has no tools,
+so a repository turn cannot read or edit files, run git, or open a pull
+request. It is a good provider for chat, drafting and anything that should stay
+entirely on your own hardware — and the wrong one for work that has to change a
+repository.
 
 **Cursor billing is not like Claude's.** A Claude Max plan is a rate limit;
 Cursor Pro includes a credit pool that manually-selected frontier models draw
@@ -58,9 +83,10 @@ npm install -g https://github.com/9thdesigns/cma-agent
 Homebrew pulls Node in as a dependency; npm assumes you already have Node 20+.
 Either way you also need at least one of
 [Claude Code](https://claude.com/product/claude-code),
-[Cursor CLI](https://cursor.com/cli) or
+[Cursor CLI](https://cursor.com/cli),
 [Gemini CLI](https://github.com/google-gemini/gemini-cli) installed and signed
-in.
+in, or [Ollama](https://ollama.com/download) with at least one model pulled —
+that last one needs no account at all.
 
 To uninstall: `brew uninstall cma-agent`, or
 `npm uninstall -g @configuremyai/cma-agent`.
@@ -144,18 +170,51 @@ wrong account.
 > guess at, so it supports the ambient login only rather than pretending to
 > isolate profiles it cannot.
 
-`--account` is optional and only used to show a masked hint (`y•••@work.com`) so
-you can tell two logins apart in a dropdown. It is not read from Claude Code's
-files, and it is not used for authentication.
+`--account` is optional. It is a note to yourself, shown masked (`y•••@work.com`)
+when nothing better is known — it is not read from Claude Code's files and never
+used for authentication.
 
-Both labels then appear in the **Claude login** picker when you create an
-Anthropic provider in the web app.
+Both labels then appear in the **Claude login** picker when you create a
+provider in the web app.
+
+### Which account is this, really?
+
+A label is what you typed. The account is what the CLI resolves, and they are
+different claims — so the companion reads the account back out of each login's
+own config directory (`.claude.json`, beside the credential rather than in it —
+no token is ever read) and shows it everywhere the login appears:
+
+```sh
+cma-agent accounts
+```
+
+```
+Claude Code  [claude_code]  2.1.220
+  ✓ Default  [default]
+      account:   dave@personal.com
+      folder:    this machine's own Claude Code login (no CLAUDE_CONFIG_DIR override)
+      provider:  "Claude Code on MacBookPro"
+  ✓ Work  [work]
+      account:   dave@acme.com
+      folder:    ~/.configure-my-ai/claude-profiles/work
+      provider:  "Claude Code · Work"
+```
+
+The same account then opens every run in the terminal…
+
+```
+→ Claude Code (account: dave@acme.com): claude-opus-5 on "work" in ~/code/site…
+```
+
+…and is the first line of the thinking log in the web app, so a session says
+which subscription paid for it without you having to remember.
 
 > **macOS note.** Claude Code stores credentials in the system Keychain, and how
 > completely a per-profile `CLAUDE_CONFIG_DIR` isolates them can vary by Claude
-> Code version. Run `cma-agent claude:scan` after adding a second login and check
-> the reported state — if two profiles have collapsed onto the same account, you
-> will see it there rather than discovering it when the wrong plan gets billed.
+> Code version — two logins can collapse onto one account while their labels go
+> on insisting otherwise. `cma-agent accounts` says so outright when two logins
+> resolve to the same address, which is the point of reading it back rather than
+> trusting the label.
 
 ## Local repositories
 
@@ -293,6 +352,7 @@ distinguish a long run from a dead one — buffering emits nothing until the end
 | `repos:add PATH` | Share a folder so the web app can see the repositories in it |
 | `repos:list` | Show shared folders and the repositories found |
 | `repos:remove PATH` | Stop sharing a folder |
+| `accounts` | Which account each login signs in as, and the provider that spends it |
 | `runtimes:list` | Show every runtime and the logins on this machine |
 | `runtimes:add --runtime R --label X` | Add a separate login and sign into it |
 | `runtimes:login --runtime R [--profile X]` | Sign a login in again after it expires |
@@ -307,9 +367,11 @@ distinguish a long run from a dead one — buffering emits nothing until the end
 | `CMA_SERVER_URL` | Point at a different host (default `https://configuremyai.com`) |
 | `CMA_DEVICE_TOKEN` | Supply the device token directly instead of `config.json` |
 | `CMA_AGENT_HOME` | Where state lives (default `~/.configure-my-ai`) |
+| `CMA_HIDE_ACCOUNT_EMAIL` | Set to `1` to keep the resolved account address on this machine. The masked hint (`d•••@acme.com`) is still reported, so two logins stay tellable apart in the web app, and this machine's own terminal still prints the address in full |
 | `CMA_CLAUDE_BIN` | Path to the `claude` binary. Only needed for a non-standard install — `~/.local/bin`, Homebrew and the npm/bun globals are found automatically, on `PATH` or not |
 | `CMA_CURSOR_BIN` | The same, for `cursor-agent` |
 | `CMA_GEMINI_BIN` | The same, for `gemini` |
+| `CMA_OLLAMA_URL` | Where Ollama listens, when it isn't `http://127.0.0.1:11434` — a container, or another box on your network. Takes precedence over `OLLAMA_HOST`, which is also read (and whose bind-address forms, `0.0.0.0:11434` and a bare port, are understood). Setting this also makes the runtime count as present even with no `ollama` binary on this machine |
 | `CMA_IDLE_TIMEOUT_MS` | How long a run may produce **no output** before it is stopped (default 600000 — 10 min, which clears the longest single Bash tool call). This is a silence budget, not a duration budget — a run that keeps streaming never hits it, however long it takes |
 | `CMA_MAX_RUN_MS` | Backstop for a wedged process that is somehow still emitting (default 4 h). Not a budget for real work |
 
@@ -334,6 +396,7 @@ object is the only thing that should need editing — check the installed build'
 | `src/runtimes/claude-code.js` | Claude Code 2.1.220 |
 | `src/runtimes/cursor.js` | the flag surface two independent third-party adapters use (`@sumeru/adapter-cursor-agent`, `pi-cursor-agent`) plus Cursor's CLI reference |
 | `src/runtimes/gemini.js` | flags read out of the shipped bundle of `@google/gemini-cli` 0.54.4 |
+| `src/runtimes/ollama.js` | Ollama's `/api/chat`, `/api/tags` and `/api/version` — no argv, see `transport: "http"` |
 
 `src/engine.js` holds everything that is the same whatever the vendor: spawning,
 the NDJSON reader, the idle contract, the heartbeat, partial text, and the
