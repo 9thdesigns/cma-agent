@@ -91,74 +91,6 @@ that last one needs no account at all.
 To uninstall: `brew uninstall cma-agent`, or
 `npm uninstall -g @configuremyai/cma-agent`.
 
-### Publishing
-
-`bin/release-agent` in the main repository does the whole release: it mirrors
-this directory into a public source repository, tags the version from
-`package.json`, checksums the tarball GitHub generates for that tag, and commits
-the filled-in formula to the tap.
-
-It needs two repositories, both **public**, both empty to start with:
-
-| Repository | Holds |
-| --- | --- |
-| `github.com/9thdesigns/cma-agent` | this directory, mirrored on each release |
-| `github.com/9thdesigns/homebrew-tap` | `Formula/cma-agent.rb` |
-
-The tap **must** be called `homebrew-tap`. That name is what lets Homebrew
-resolve the short form `9thdesigns/tap`. (An earlier version of these docs said
-`configuremyai/tap` — no such org, which is why `brew install` failed.)
-
-```sh
-bin/release-agent --dry-run   # render everything, push nothing
-bin/release-agent             # publish, then announce
-```
-
-#### Announcing
-
-Publishing and announcing are two halves of one release, and `bin/release-agent`
-runs both. The second half is the one that kept going missing: a tag would land,
-nobody would be told, `package.json` would move on, and no later deploy would
-ever look back — 0.11.1 shipped in silence exactly that way.
-
-So after publishing, the script runs the announcement on the app itself:
-
-```sh
-heroku run --exit-code --app configure-my-ai -- bundle exec rails agent:release:announce_pending
-```
-
-`--exit-code` is load-bearing. Without it `heroku run` exits 0 no matter what
-the dyno did, and a refused announcement would read as a delivered one.
-
-Everything that could stop it is checked **before** anything is pushed — the
-Heroku CLI being absent, not being logged in, the app not being one you can see
-— because finding out afterwards leaves a version people can install and nobody
-knows about. Each failure names the command that fixes it.
-
-Running the script again on a version that is already published is not a no-op:
-it still asks, so a release that was published but never announced gets its
-notification. `announce_pending` sends nothing when there is nothing pending.
-
-| Flag | Why |
-| --- | --- |
-| `--no-announce` | publish quietly; also `CMA_ANNOUNCE=0` |
-| `--app NAME` | a Heroku app other than `configure-my-ai`; also `CMA_HEROKU_APP` |
-| `--dry-run` | renders a formula and never announces |
-
-Then set these on the web app so the walkthrough and docs stop telling people to
-build from source:
-
-```sh
-CMA_AGENT_INSTALL_COMMAND="brew install 9thdesigns/tap/cma-agent"
-CMA_AGENT_UNINSTALL_COMMAND="brew uninstall cma-agent"
-```
-
-`agent/` here stays the source of truth — the public repository is a publish
-target, overwritten on every release, so the two cannot drift.
-
-The formula lives at `agent/homebrew/cma-agent.rb` with placeholders the script
-fills. Edit that one, never the copy in the tap.
-
 ## Setup
 
 ```sh
@@ -484,7 +416,7 @@ object is the only thing that should need editing — check the installed build'
 the NDJSON reader, the idle contract, the heartbeat, partial text, and the
 cancel path. It never names a runtime.
 
-`agent/test/runtimes.test.js` asserts that the three express the SAME allowance
+`test/runtimes.test.js` asserts that the three express the SAME allowance
 in their three different syntaxes — Claude Code as `--allowedTools`, Cursor as a
 `permissions.json`, Gemini as `--approval-mode` plus `--allowed-tools`. That is
 the test that catches "we accidentally gave Cursor a shell".
