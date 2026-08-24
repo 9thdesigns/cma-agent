@@ -16,9 +16,13 @@ import os from "node:os"
 import path from "node:path"
 
 import { baseArgs } from "../src/runtimes/claude-code.js"
-import { writeConfig } from "../src/runtimes/cursor.js"
-import { envForWeb, mcpServersFor } from "../src/runtimes/shared.js"
-import { WEB_TOOLS } from "../src/mcp_web.js"
+import { baseArgs as geminiArgs } from "../src/runtimes/gemini.js"
+import { cursor, writeConfig } from "../src/runtimes/cursor.js"
+import { RUNTIMES } from "../src/runtimes/index.js"
+import { withoutCapabilityFlags } from "../src/engine.js"
+import { BUILTIN_WEB_TOOLS, builtinWebTools, envForWeb, mcpServersFor } from "../src/runtimes/shared.js"
+import { pickServedTools, WEB_TOOLS } from "../src/mcp_web.js"
+import { resolveTools } from "../src/mcp.js"
 
 const valueOf = (args, flag) => {
   const i = args.indexOf(flag)
@@ -44,10 +48,77 @@ function tempDir() {
 // The tool surface matches the server's operations
 // ---------------------------------------------------------------------------
 
-test("the web tools are exactly the server's operations: fetch, browse, search", () => {
+test("the web tools are exactly the server's operations: fetch, browse, search, request", () => {
   // The tool name IS the operation path segment (POST /api/code/v1/web/<op>),
   // so a rename on either side is a break this assertion catches.
-  assert.deepEqual(WEB_TOOLS.map((t) => t.name).sort(), ["browse", "fetch", "search"])
+  assert.deepEqual(WEB_TOOLS.map((t) => t.name).sort(), ["browse", "fetch", "request", "search"])
+})
+
+test("request is the only tool that can carry a credential", () => {
+  // The transcript this pins: a run was handed an API base URL and a bearer
+  // token, and had no tool that could put the two together — fetch takes no
+  // headers, browse cannot attach one to a navigation. It reported that it
+  // could not make the call at all.
+  const byName = Object.fromEntries(WEB_TOOLS.map((t) => [t.name, t]))
+
+  assert.ok(byName.request.inputSchema.properties.headers, "request must accept headers")
+  assert.ok(byName.request.inputSchema.properties.method, "request must accept a method")
+  assert.ok(byName.request.inputSchema.properties.body, "request must accept a body")
+  assert.ok(!byName.fetch.inputSchema.properties.headers,
+    "fetch stays a page reader — headers belong to request")
+})
+
+test("request tells the model a non-2xx is an answer, not a retry", () => {
+  // A 401 or a 422 arrives as a normal result with the body intact, because
+  // that body is the diagnostic. A model that reads the status as a tool
+  // failure retries the same call instead of reading why it failed.
+  assert.match(WEB_TOOLS.find((t) => t.name === "request").description, /non-2xx/i)
+})
+
+// ---------------------------------------------------------------------------
+// The served tool list: the server's surface wins, the baked one is the floor
+// ---------------------------------------------------------------------------
+
+test("a served tool list replaces the baked one — how a new tool reaches an old build", () => {
+  // The failure this ends: `request` existed on the server for months while
+  // a machine's binary kept showing fetch/browse only, because the binary
+  // ships by Homebrew release and the tool list was frozen inside it.
+  const served = {
+    ok: true,
+    tools: [
+      { name: "fetch", description: "…", inputSchema: { type: "object" } },
+      { name: "request", description: "…", inputSchema: { type: "object" } },
+      { name: "brand_new_op", description: "added server-side later", inputSchema: { type: "object" } }
+    ]
+  }
+
+  const picked = pickServedTools(served, WEB_TOOLS)
+  assert.deepEqual(picked.map((t) => t.name), ["fetch", "request", "brand_new_op"])
+})
+
+test("a bad or empty served answer keeps the baked list — nothing a machine had can be lost", () => {
+  for (const payload of [null, {}, { tools: [] }, { tools: "nope" }, { tools: [{ junk: true }] }]) {
+    assert.equal(pickServedTools(payload, WEB_TOOLS), WEB_TOOLS)
+  }
+})
+
+test("entries missing a name, description or schema are dropped, not served broken", () => {
+  const served = { tools: [
+    { name: "good", description: "d", inputSchema: {} },
+    { name: "no_schema", description: "d" },
+    { description: "no name", inputSchema: {} }
+  ] }
+
+  assert.deepEqual(pickServedTools(served, WEB_TOOLS).map((t) => t.name), ["good"])
+})
+
+test("resolveTools prefers the list hook and falls back to baked on failure", async () => {
+  const dynamic = [{ name: "served", description: "d", inputSchema: {} }]
+  assert.deepEqual(await resolveTools({ tools: WEB_TOOLS, list: async () => dynamic }), dynamic)
+  assert.equal(await resolveTools({ tools: WEB_TOOLS, list: async () => { throw new Error("offline") } }), WEB_TOOLS)
+  assert.equal(await resolveTools({ tools: WEB_TOOLS, list: () => [] }), WEB_TOOLS)
+  // The github server's plain sync list keeps working untouched.
+  assert.deepEqual(await resolveTools({ tools: WEB_TOOLS, list: () => WEB_TOOLS }), WEB_TOOLS)
 })
 
 test("every web tool says it needs no permission — the whole point", () => {
@@ -82,6 +153,92 @@ test("web and GitHub grants mount side by side without disturbing each other", (
 
   const config = JSON.parse(valueOf(args, "--mcp-config"))
   assert.deepEqual(Object.keys(config.mcpServers).sort(), ["cma_github", "cma_web"])
+})
+
+test("Claude Code's own web tools are denied, in every shape of job", () => {
+  // The bug this pins: --allowedTools is an AUTO-APPROVE list, not an
+  // exclusive one, so WebFetch stayed in the schema the model is handed. A
+  // tool the model can see beats a system prompt telling it not to reach for
+  // that tool — it called WebFetch, got "requires approval", and a headless
+  // run has nobody to approve. Denying it removes it from the tool list, so
+  // there is nothing left to reach for.
+  for (const job of [
+    { model: "claude-opus-5", system: "…" },
+    { model: "claude-opus-5", system: "…", web: WEB },
+    { model: "claude-opus-5", system: "…", web: WEB, github: GITHUB, workdir: "/repo" }
+  ]) {
+    const denied = listOf(baseArgs(job), "--disallowedTools")
+    assert.ok(denied.includes("WebFetch"), "WebFetch must be denied")
+    assert.ok(denied.includes("WebSearch"), "WebSearch must be denied")
+  }
+})
+
+test("a job with no grants at all is still denied the built-in web tools", () => {
+  // Denying used to hang off the allow list, so a job with nothing granted
+  // got no deny list either — the one case that most needed it, since it has
+  // no cma_web channel to fall back on and WebFetch could never be approved.
+  const args = baseArgs({ model: "claude-opus-5", system: "…" })
+
+  assert.equal(valueOf(args, "--allowedTools"), null, "nothing is auto-approved")
+  assert.ok(listOf(args, "--disallowedTools").includes("WebFetch"))
+})
+
+test("denying the built-ins does not disturb the git denials next to them", () => {
+  const denied = listOf(baseArgs({ model: "claude-opus-5", workdir: "/repo" }), "--disallowedTools")
+
+  assert.ok(denied.includes("Bash(git push --force:*)"))
+  assert.ok(denied.includes("Bash(git reset --hard:*)"))
+  assert.ok(denied.includes("WebFetch"))
+})
+
+// ---------------------------------------------------------------------------
+// Every runtime, not just Claude Code
+// ---------------------------------------------------------------------------
+
+test("every registered runtime has an entry in the built-in web tool map", () => {
+  // A runtime missing from the map denies nothing, silently. Pinning the key
+  // set means adding the next vendor forces a decision about its web tools
+  // rather than defaulting to "left on the surface" without anyone noticing.
+  for (const runtime of RUNTIMES) {
+    assert.ok(runtime.id in BUILTIN_WEB_TOOLS, `${runtime.id} must be listed, even as []`)
+  }
+})
+
+test("Gemini's own web tools are excluded, in every job shape", () => {
+  // --allowed-tools only auto-APPROVES, exactly like Claude Code's
+  // --allowedTools, so it never removed google_web_search or web_fetch. And
+  // Gemini only passed it for a repository turn, so a chat turn was doubly
+  // uncovered.
+  for (const job of [{ model: "gemini-3-pro-preview" }, { model: "x", workdir: "/repo" }]) {
+    const excluded = valueOf(geminiArgs(job), "--exclude-tools")
+    assert.ok(excluded, "--exclude-tools must be passed")
+    assert.deepEqual(excluded.split(","), ["google_web_search", "web_fetch"])
+  }
+})
+
+test("Gemini's exclusion never costs the turn if a build rejects the flag", () => {
+  // The rule this codebase already learned twice: a flag we added must not be
+  // able to kill a run. --exclude-tools has to be strippable like the rest.
+  assert.ok(withoutCapabilityFlags(geminiArgs({ model: "x", workdir: "/repo" }))
+    .every((arg) => arg !== "--exclude-tools" && !arg.includes("google_web_search")))
+})
+
+test("Cursor's uncovered web tools are stated rather than guessed at", () => {
+  // cursor-agent names tools in a permissions file, and its web tool's name
+  // was never verified against a real build. An invented deny entry would be
+  // inert and would read as coverage — so the map is empty on purpose and the
+  // adapter says so out loud.
+  assert.deepEqual(builtinWebTools("cursor"), [])
+  assert.ok(cursor.limitations.some((line) => /web/i.test(line)),
+    "Cursor must declare the gap so it is visible rather than silently missing")
+})
+
+test("Ollama has no web tools to remove because it has no tools at all", () => {
+  assert.deepEqual(builtinWebTools("ollama"), [])
+})
+
+test("an unknown runtime denies nothing rather than throwing", () => {
+  assert.deepEqual(builtinWebTools("something_new"), [])
 })
 
 test("a chat job with neither grant mounts nothing", () => {

@@ -1,5 +1,6 @@
 import {
-  classifyFailure, emptyUsage, locateBin, locationAdvice, normalizeUsage, shortCommand, shortPath
+  builtinWebTools, classifyFailure, emptyUsage, locateBin, locationAdvice, normalizeUsage,
+  shortCommand, shortPath
 } from "./shared.js"
 
 // ---------------------------------------------------------------------------
@@ -49,7 +50,10 @@ const CLI = {
   approvalMode: (mode) => ["--approval-mode", mode],
   // Comma-separated, coerced by the CLI. One flag, one value — not variadic,
   // so it cannot swallow anything.
-  allowedTools: (list) => ["--allowed-tools", list.join(",")]
+  allowedTools: (list) => ["--allowed-tools", list.join(",")],
+  // Same shape. --allowed-tools only auto-APPROVES; it removes nothing, so it
+  // is no help against a tool we want gone from the surface entirely.
+  excludeTools: (list) => ["--exclude-tools", list.join(",")]
 }
 
 // Gemini's own tool names, taken from the shipped bundle. Read and edit only —
@@ -67,6 +71,18 @@ const FILE_TOOLS = [
 export function baseArgs(job) {
   const args = [...CLI.streamFormat]
   if (job.model) args.push(...CLI.model(job.model))
+
+  // Gemini's own google_web_search and web_fetch, gone in EVERY job shape —
+  // not only a repository turn. The reasoning is the one that applies to any
+  // runtime here: a headless run has nobody to answer a permission prompt, so
+  // the CLI's own web tools can never succeed, and a tool the model can see
+  // beats a system prompt telling it not to reach for that tool. It should be
+  // reaching for mcp__cma_web__* instead, which needs no grant.
+  //
+  // --exclude-tools is registered in engine.js's CAPABILITY_FLAGS, so a build
+  // that does not parse it loses the exclusion rather than the whole turn.
+  const builtins = builtinWebTools("gemini_cli")
+  if (builtins.length > 0) args.push(...CLI.excludeTools(builtins))
 
   if (job.workdir) {
     // Edits without prompting, nothing else. A headless run has no terminal to

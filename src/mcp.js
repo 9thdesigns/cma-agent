@@ -326,6 +326,20 @@ function respondError(id, code, message) {
 // differs — the name Claude Code sees, the tool list, and how a call is
 // executed — so the web server (mcp_web.js) is a spec, not a second copy of
 // this file that can drift.
+// The spec's live tool surface. list() may be async and may fail (no
+// network at startup); the baked spec.tools is always the floor, never less.
+async function resolveTools(spec) {
+  try {
+    const listed = await spec.list()
+    if (Array.isArray(listed) && listed.length > 0) return listed
+  } catch (_error) {
+    // fall through to the baked list
+  }
+  return spec.tools
+}
+
+export { resolveTools }
+
 function makeHandler(spec) {
   return async function handle(request) {
     const { id, method, params } = request
@@ -345,12 +359,17 @@ function makeHandler(spec) {
         return
 
       case "tools/list":
-        respond(id, { tools: spec.list() })
+        // Awaited, because a list can now come from the server (the web
+        // server fetches its surface at startup). A plain sync array is
+        // awaited into itself, so the github server is unchanged.
+        respond(id, { tools: await resolveTools(spec) })
         return
 
       case "tools/call": {
         const name = params?.name
-        const tool = spec.tools.find((t) => t.name === name)
+        // The SAME resolved list as tools/list, not the baked spec.tools —
+        // a tool the server added must be callable, not merely visible.
+        const tool = (await resolveTools(spec)).find((t) => t.name === name)
         if (!tool) {
           respondError(id, -32602, `Unknown tool ${name}`)
           return

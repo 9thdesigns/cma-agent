@@ -294,6 +294,25 @@ export const cursor = {
   describeEvent,
   collapseEvents,
   partialTextFrom,
+  // The one runtime whose own web tools are still on its surface.
+  //
+  // Claude Code takes --disallowedTools and Gemini takes --exclude-tools, so
+  // both have their built-in web tools removed and are left with
+  // mcp__cma_web__*, which needs no grant. cursor-agent names tools in the
+  // permissions file this adapter writes rather than in a documented flag, and
+  // its web tool's name was never checked against a real build — the same trap
+  // the model ids in AiCredential::LOCAL_RUNTIMES fell into, where names
+  // written from what a vendor calls something failed at run time.
+  //
+  // A guessed deny entry would be inert and would read as coverage, so the gap
+  // is stated instead of papered over. Closing it needs one look at a real
+  // cursor-agent build: add the name to BUILTIN_WEB_TOOLS.cursor in shared.js
+  // and to the deny set in permissionsFor, and this line goes away.
+  limitations: [
+    "Cursor's own web search is not removed from the run — prefer the " +
+      "mcp__cma_web__* tools, which need no approval."
+  ],
+
   classifyFailure: (detail) =>
     classifyFailure(detail, { name: "Cursor", loginHint: "cma-agent runtimes:login --runtime cursor" }),
 

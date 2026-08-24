@@ -214,6 +214,58 @@ export const GIT_VERBS = [
 // producing it — a force-push discards someone else's commits, `reset --hard`
 // and `clean -fd` discard the user's. None of them is ever the only way to
 // finish a task, so a turn that wants one can say so instead.
+// Claude Code's own web tools, denied in EVERY job rather than merely left
+// un-approved.
+//
+// Leaving them on the surface was the bug. `--allowedTools` is an
+// auto-approve list, not an exclusive one, so WebFetch stayed in the tool
+// schema the model is handed — and a tool the model can see beats a system
+// prompt telling it not to reach for that tool. It then spends the turn
+// asking for a grant that cannot arrive, because a headless run has nobody to
+// answer a permission prompt. That is the transcript this whole web channel
+// exists to prevent, and the prompt alone never fully stopped it.
+//
+// `--disallowedTools` removes them from the tool list rather than denying at
+// call time, so there is nothing left to reach for and their schemas stop
+// riding along in every request.
+//
+// Denied even when this job has no web channel of its own: a permission-gated
+// tool in a headless run can never succeed, so it is dead weight there too —
+// and the prompt already tells that run to say which page it could not read.
+// Keyed by runtime id, because every CLI ships its own and calls them
+// something different. One map so a runtime cannot be quietly left out: an id
+// missing from here denies nothing, which is a silence worth being able to
+// see in one place.
+//
+// Confidence differs per entry, and pretending otherwise is how an unverified
+// vendor string ends up shipped as though it were checked:
+//
+//   claude_code — VERIFIED against the installed build. Denying three tools
+//     that were present and asking the model to list what it has shows them
+//     gone, so the deny removes them from the surface rather than refusing the
+//     call.
+//   gemini_cli  — from Gemini's documented tool set, the same set FILE_TOOLS in
+//     gemini.js was read out of, and every name in that list matches. Not
+//     machine-checked here. It rides --exclude-tools, which is registered as a
+//     capability flag, so a build that does not take it degrades instead of
+//     dying.
+//   cursor      — EMPTY ON PURPOSE. cursor-agent names its tools in a
+//     permissions file rather than a documented flag, and its web tool's name
+//     was never verified against a real build. A guessed entry there would be
+//     inert and would read as coverage, which is worse than the gap. Stated in
+//     the adapter's `limitations` instead.
+//   ollama      — genuinely none: that runtime has no tools at all.
+export const BUILTIN_WEB_TOOLS = {
+  claude_code: ["WebFetch", "WebSearch"],
+  gemini_cli: ["google_web_search", "web_fetch"],
+  cursor: [],
+  ollama: []
+}
+
+export function builtinWebTools(runtimeId) {
+  return BUILTIN_WEB_TOOLS[runtimeId] || []
+}
+
 export const FORBIDDEN_GIT = [
   "git push --force",
   "git push -f",
@@ -262,9 +314,9 @@ export function githubMcpServers() {
   }
 }
 
-// The MCP server carrying the app's web access — fetch, browse, search, all
-// run server-side with no permission prompt. Same shape as the GitHub server
-// for the same reasons.
+// The MCP server carrying the app's web access — fetch, browse, search and
+// request, all run server-side with no permission prompt. Same shape as the
+// GitHub server for the same reasons.
 export const WEB_MCP_SERVER = "cma_web"
 
 export function envForWeb(job) {

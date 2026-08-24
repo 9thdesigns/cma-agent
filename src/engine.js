@@ -531,7 +531,7 @@ function looksUnsupported(stderr) {
 // a flag we added is the failure mode this codebase has already produced twice.
 const CAPABILITY_FLAGS = new Set([
   "--mcp-config", "--allowedTools", "--disallowedTools", "--permission-mode",
-  "--allowed-tools", "--approval-mode", "--force", "--workspace"
+  "--allowed-tools", "--exclude-tools", "--approval-mode", "--force", "--workspace"
 ])
 
 function rejectedCapabilityFlag(stderr) {

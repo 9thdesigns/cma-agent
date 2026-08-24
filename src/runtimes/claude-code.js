@@ -3,9 +3,9 @@ import os from "node:os"
 import path from "node:path"
 
 import {
-  classifyFailure, emptyUsage, envForGithub, envForWeb, firstKey, FORBIDDEN_GIT, GIT_VERBS,
-  GITHUB_MCP_SERVER, locateBin, locationAdvice, maskAccount, mcpServersFor, WEB_MCP_SERVER,
-  normalizeUsage, shortCommand, shortPath
+  builtinWebTools, classifyFailure, emptyUsage, envForGithub, envForWeb, firstKey,
+  FORBIDDEN_GIT, GIT_VERBS, GITHUB_MCP_SERVER, locateBin, locationAdvice, maskAccount,
+  mcpServersFor, WEB_MCP_SERVER, normalizeUsage, shortCommand, shortPath
 } from "./shared.js"
 
 // ---------------------------------------------------------------------------
@@ -64,7 +64,10 @@ const FILE_TOOLS = ["Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob"
 // Prefix-matched by Claude Code: `Bash(git commit:*)` covers any git commit
 // invocation and nothing else.
 const GIT_TOOLS = GIT_VERBS.map((verb) => `Bash(git ${verb}:*)`)
-const FORBIDDEN_TOOLS = FORBIDDEN_GIT.map((command) => `Bash(${command}:*)`)
+const FORBIDDEN_TOOLS = [
+  ...FORBIDDEN_GIT.map((command) => `Bash(${command}:*)`),
+  ...builtinWebTools("claude_code")
+]
 
 function allowedToolsFor(job) {
   const tools = []
@@ -103,10 +106,13 @@ export function baseArgs(job) {
   if (job.github?.token || job.web?.token) args.push(...CLI.mcpConfig(mcpConfigFor(job)))
 
   const allowed = allowedToolsFor(job)
-  if (allowed.length > 0) {
-    args.push(...CLI.allowedTools(allowed))
-    args.push(...CLI.disallowedTools(FORBIDDEN_TOOLS))
-  }
+  if (allowed.length > 0) args.push(...CLI.allowedTools(allowed))
+
+  // Unconditional, unlike the allow list: a job with no grants at all still
+  // must not be handed WebFetch, which it could never get approved. Stays
+  // last, and the prompt still arrives on stdin, so there is no positional
+  // for these variadic flags to swallow.
+  args.push(...CLI.disallowedTools(FORBIDDEN_TOOLS))
 
   return args
 }

@@ -212,8 +212,27 @@ test("stripping capability flags leaves a runnable argv and takes their values w
   assert.equal(valueOf(stripped, "--append-system-prompt"), "…")
 })
 
-test("stripping is a no-op for a job that had no capability flags", () => {
+test("stripping a bare job's deny list still leaves a runnable argv", () => {
+  // This used to assert stripping was a no-op here, on the premise that a
+  // plain chat job carried no capability flags. That premise is gone on
+  // purpose: every job now carries --disallowedTools, because WebFetch has to
+  // be denied even where nothing is granted — a headless run can never get it
+  // approved, and leaving it on the surface is what made runs reach for it.
+  //
+  // So the property worth pinning is no longer "no-op" but "still runnable,
+  // and the deny values left with their flag".
   const plain = streamingArgs({ model: "claude-opus-5", system: "…" })
+  assert.ok(plain.includes("--disallowedTools"), "a bare job still denies the built-in web tools")
+  assert.ok(plain.includes("WebFetch"))
 
-  assert.deepEqual(withoutCapabilityFlags(plain), plain)
+  const stripped = withoutCapabilityFlags(plain)
+
+  assert.ok(!stripped.includes("--disallowedTools"))
+  assert.ok(!stripped.includes("WebFetch"), "a value left behind becomes a positional")
+  assert.ok(!stripped.includes("WebSearch"))
+  assert.deepEqual(positionalsIn(stripped), [])
+
+  assert.ok(stripped.includes("-p"))
+  assert.equal(valueOf(stripped, "--model"), "claude-opus-5")
+  assert.equal(valueOf(stripped, "--append-system-prompt"), "…")
 })
