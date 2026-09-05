@@ -33,6 +33,11 @@ import { classifyFailure, emptyUsage, locateBin, normalizeUsage } from "./shared
 // why `limitations` says so out loud and the web app repeats it at the point
 // where somebody picks this runtime.
 //
+// Vision, on the other hand, it CAN do: /api/chat takes base64 images per
+// message, and the open-weight vision families (qwen2.5vl, llava,
+// llama3.2-vision, …) run here. The server sends image parts only for a model
+// it knows can read them — see messagesFor for the wire shape.
+//
 // ── Models ────────────────────────────────────────────────────────────────
 //
 // Nobody can tell you what models this runtime has. Not us, not a catalogue,
@@ -63,6 +68,27 @@ function connectTimeoutMs() {
 // answer from memory: if localhost hasn't replied in five seconds, nothing is
 // listening.
 const PROBE_TIMEOUT_MS = 5000
+
+// How long Ollama keeps the model loaded after this request. Its own default
+// is five minutes, which makes every pause longer than that pay the full
+// model load — tens of seconds on a 7B, minutes on bigger weights — before
+// the next turn's first token. That reload is most of why a local run "takes
+// forever" on the turn after a coffee break, so half an hour is the default
+// here: long enough to span the gaps real conversations have, on hardware
+// whose owner chose to run this.
+//
+// CMA_OLLAMA_KEEP_ALIVE overrides it — a Go duration ("10m", "24h"), or a
+// number of seconds; -1 keeps the model loaded until Ollama itself stops,
+// 0 restores unload-immediately for a RAM-tight machine.
+const DEFAULT_KEEP_ALIVE = "30m"
+
+function keepAlive() {
+  const raw = String(process.env.CMA_OLLAMA_KEEP_ALIVE || "").trim()
+  if (!raw) return DEFAULT_KEEP_ALIVE
+  // Ollama reads a bare number as seconds and a string as a duration; "-1"
+  // only means "forever" as a number, so numeric shapes are sent as numbers.
+  return /^-?\d+$/.test(raw) ? Number(raw) : raw
+}
 
 // Turn whatever the user has in their environment into an origin we can call.
 //
@@ -138,10 +164,32 @@ export function messagesFor(job) {
   for (const message of job.messages || []) {
     const role = message.role === "assistant" ? "assistant" : "user"
     const content = typeof message.content === "string" ? message.content : JSON.stringify(message.content)
-    messages.push({ role, content })
+    const entry = { role, content }
+    const images = imagesFor(message)
+    if (images.length > 0) entry.images = images
+    messages.push(entry)
   }
 
   return messages
+}
+
+// The screenshots a vision turn carries, in the raw-base64 form Ollama's
+// /api/chat documents (`messages[].images`, no data: URI wrapper).
+//
+// The server sends provider-neutral parts — { media_type:, data: <base64> } —
+// and only sends them at all when the model's family can read them (the same
+// open-weight vision families the managed server routes to: qwen2.5vl, llava,
+// llama3.2-vision, …). Bare strings and data: URIs are tolerated so the shape
+// can loosen upstream without stranding a machine on an older server. A
+// text-only model job simply never carries the key, and nothing here changes.
+function imagesFor(message) {
+  const list = Array.isArray(message?.images) ? message.images : []
+  return list
+    .map((part) => {
+      const data = typeof part === "string" ? part : String(part?.data || "")
+      return data.replace(/^data:[^,]*;base64,/, "").trim()
+    })
+    .filter(Boolean)
 }
 
 // What the engine POSTs. Shaped as data rather than performed here so a test
@@ -163,6 +211,9 @@ export function buildRequest(job) {
       model: job.model || undefined,
       messages: messagesFor(job),
       stream: true,
+      // See DEFAULT_KEEP_ALIVE: without this, every pause past five minutes
+      // pays the model load again on the next turn.
+      keep_alive: keepAlive(),
       ...(Object.keys(options).length > 0 ? { options } : {})
     }
   }
