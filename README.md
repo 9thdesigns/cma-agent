@@ -43,7 +43,10 @@ within about thirty seconds; `ollama rm` removes it.
 so a repository turn cannot read or edit files, run git, or open a pull
 request. It is a good provider for chat, drafting and anything that should stay
 entirely on your own hardware — and the wrong one for work that has to change a
-repository.
+repository. What it *can* do that text-only suggests otherwise: read images.
+A vision model (`qwen2.5vl`, `llava`, `llama3.2-vision`, …) gets a chat's
+screenshots as pixels — the web app sends them only to models that can read
+them, and only to a companion new enough to forward them.
 
 **Cursor billing is not like Claude's.** A Claude Max plan is a rate limit;
 Cursor Pro includes a credit pool that manually-selected frontier models draw
@@ -612,6 +615,7 @@ distinguish a long run from a dead one — buffering emits nothing until the end
 | `CMA_CURSOR_BIN` | The same, for `cursor-agent` |
 | `CMA_GEMINI_BIN` | The same, for `gemini` |
 | `CMA_OLLAMA_URL` | Where Ollama listens, when it isn't `http://127.0.0.1:11434` — a container, or another box on your network. Takes precedence over `OLLAMA_HOST`, which is also read (and whose bind-address forms, `0.0.0.0:11434` and a bare port, are understood). Setting this also makes the runtime count as present even with no `ollama` binary on this machine |
+| `CMA_OLLAMA_KEEP_ALIVE` | How long Ollama keeps a model loaded after a run (default `30m`; Ollama's own default is 5 minutes, so the turn after a longer pause used to pay the whole model load again before its first token). A Go duration (`10m`, `24h`) or seconds as a number; `-1` keeps the model loaded until Ollama stops, `0` restores unload-immediately for a RAM-tight machine |
 | `CMA_IDLE_TIMEOUT_MS` | How long a run may produce **no output** before it is stopped (default 600000 — 10 min, which clears the longest single Bash tool call). This is a silence budget, not a duration budget — a run that keeps streaming never hits it, however long it takes |
 | `CMA_MAX_RUN_MS` | Backstop for a wedged process that is somehow still emitting (default 4 h). Not a budget for real work |
 

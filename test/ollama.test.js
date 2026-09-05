@@ -140,6 +140,50 @@ test("the request streams, names the model, and maps the sampling options", () =
   assert.equal(request.body.options.num_predict, 1024)
 })
 
+test("the model is kept warm past Ollama's five-minute default", () => {
+  // Ollama unloads after five idle minutes, so the turn after a pause paid
+  // the whole model load again before its first token — most of what made a
+  // local run feel slow. The request says how long to keep the weights up.
+  const request = withEnv({ CMA_OLLAMA_KEEP_ALIVE: null }, () => buildRequest(JOB))
+  assert.equal(request.body.keep_alive, "30m")
+})
+
+test("keep-alive is the operator's when they set it, seconds as numbers", () => {
+  // A duration string rides as-is…
+  const tuned = withEnv({ CMA_OLLAMA_KEEP_ALIVE: "2h" }, () => buildRequest(JOB))
+  assert.equal(tuned.body.keep_alive, "2h")
+  // …and a numeric shape goes as a number, because "-1" only means "never
+  // unload" to Ollama when it is one.
+  const forever = withEnv({ CMA_OLLAMA_KEEP_ALIVE: "-1" }, () => buildRequest(JOB))
+  assert.equal(forever.body.keep_alive, -1)
+})
+
+test("a vision turn's image parts ride as raw base64, per message", () => {
+  // The server sends provider-neutral parts ({media_type, data}) and only on
+  // turns whose model can read them. Ollama wants bare base64 strings in
+  // `images` — no data: wrapper, no media type.
+  const messages = messagesFor({
+    messages: [
+      { role: "user", content: "what is in this?", images: [{ media_type: "image/png", data: "AAAA" }] },
+      { role: "assistant", content: "a chart" },
+      // Tolerated shapes: a bare string, and a data: URI that gets stripped.
+      { role: "user", content: "and this?", images: ["BBBB", "data:image/jpeg;base64,CCCC"] }
+    ]
+  })
+
+  assert.deepEqual(messages[0].images, ["AAAA"])
+  assert.equal(messages[1].images, undefined)
+  assert.deepEqual(messages[2].images, ["BBBB", "CCCC"])
+})
+
+test("a text-only conversation carries no images key at all", () => {
+  // Absent, not empty: an `images: []` on every message would be a wire
+  // change for nothing.
+  for (const message of messagesFor(JOB)) {
+    assert.equal("images" in message, false)
+  }
+})
+
 test("an unset token ceiling is omitted rather than guessed at", () => {
   // We know nothing about a model somebody pulled themselves — inventing a
   // num_predict would truncate its answers for no reason.
