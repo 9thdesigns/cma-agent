@@ -427,6 +427,72 @@ export function builtinPlatformTools(runtimeId) {
   return BUILTIN_PLATFORM_TOOLS[runtimeId] || []
 }
 
+// The CLI's own file and shell tools, taken OFF a bot turn that has no
+// checkout. A bot (Autopilot) turn on a paired machine calls Configure My
+// AI's tools by writing [[TOOL:...]] markers into its reply, which the server
+// parses and runs (the job says so with `text_protocol`). The CLI kept its
+// own Read/Glob/Grep/Bash registry beside that, so a scheduled bot spent its
+// fifteen minutes wandering the laptop's disk (and the wrong checkout) with
+// one protocol while its prompt told it to use the other, and died before
+// a single platform call shipped anything. One protocol per turn: with no
+// workdir there is nothing on this disk the bot's turn is meant to touch.
+//
+// One entry per runtime, for the same reason as the web list above: an id
+// missing from here takes nothing off, and that silence should be visible in
+// one place. Not every runtime can express this as a list of NAMES, and the
+// ones that cannot say what they do instead in their own adapter:
+//
+//   claude_code — the build's own tool names, through --disallowedTools.
+//   gemini_cli  — Gemini's documented tool set (the FILE_TOOLS spellings),
+//     through --exclude-tools, a capability flag: a build that rejects it
+//     loses the exclusion, not the turn.
+//   grok        — the tool names xAI documents, as grok.js records them, on
+//     --disallowed-tools. An unknown name is inert to a deny list, which is
+//     why `bash` rides beside `run_terminal_cmd` (grok.js has seen both named).
+//     The part doing the enforcing is grok.js's HOST_WORKSPACE_RULES: the
+//     documented Read/Grep/Edit/Write/Bash permission prefixes as --deny, and
+//     a deny outranks --yolo.
+//   codewhale   — the names CodeWhale's own tool catalogue uses. Its adapter
+//     already takes them off EVERY turn without a workdir (a plain chat has no
+//     folder either), so a bot turn is covered by the same flag; the names
+//     live here so there is one list of them.
+//   codex       — EMPTY ON PURPOSE: codex has no per-tool deny. codex.js turns
+//     the shell off at the source with the `features.shell_tool` config key
+//     instead (see hostWorkspaceConfig there), and the read-only sandbox it
+//     already runs a chat under leaves apply_patch nothing to write to.
+//   cursor      — EMPTY: no verified mechanism. cursor-agent's only lever is
+//     its permissions file, and the one token spelling proven on a build is
+//     `Shell(<command>)`. cursor.js says what a bot turn still has and why.
+//   antigravity — EMPTY: agy has no flag that removes a tool, and the rules
+//     that would are in the user's own settings.json. antigravity.js says
+//     what headless mode already refuses.
+//   ollama      — genuinely none: that runtime has no tools at all.
+export const HOST_WORKSPACE_TOOLS = {
+  claude_code: ["Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "LS", "Bash", "BashOutput"],
+  gemini_cli: ["read_file", "read_many_files", "write_file", "replace", "list_directory",
+               "search_file_content", "glob", "run_shell_command"],
+  grok: ["read_file", "list_dir", "grep", "search_replace", "run_terminal_cmd", "bash"],
+  codewhale: ["read", "write", "edit", "bash"],
+  codex: [],
+  cursor: [],
+  antigravity: [],
+  ollama: []
+}
+
+// The condition on its own, for the adapters whose mechanism is not a list of
+// names (codex's config key, grok's permission rules). Every runtime has to
+// agree on WHICH turns lose the tools, so it is said once: a bot turn (the
+// server set `text_protocol`) with no checkout. A turn with a workdir keeps
+// its tools, and a plain chat (no `text_protocol`) keeps what it had.
+export function hostWorkspaceOff(job) {
+  return Boolean(job?.text_protocol) && !job?.workdir
+}
+
+export function hostWorkspaceToolsFor(runtimeId, job) {
+  if (!hostWorkspaceOff(job)) return []
+  return HOST_WORKSPACE_TOOLS[runtimeId] || []
+}
+
 export const FORBIDDEN_GIT = [
   "git push --force",
   "git push -f",

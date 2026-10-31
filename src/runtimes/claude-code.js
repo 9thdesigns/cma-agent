@@ -4,7 +4,7 @@ import path from "node:path"
 
 import {
   builtinPlatformTools, builtinWebTools, classifyFailure, emptyUsage, envForGithub, envForWeb, firstKey,
-  FORBIDDEN_GIT, GIT_VERBS, GITHUB_MCP_SERVER, locateBin, locationAdvice, loginCommand,
+  FORBIDDEN_GIT, GIT_VERBS, GITHUB_MCP_SERVER, hostWorkspaceToolsFor, locateBin, locationAdvice, loginCommand,
   maskAccount, mcpServersFor, occupancyOf, WEB_MCP_SERVER, normalizeUsage, shortCommand,
   shortPath
 } from "./shared.js"
@@ -278,7 +278,7 @@ export function baseArgs(job) {
   // must not be handed WebFetch, which it could never get approved. Stays
   // last, and the prompt still arrives on stdin, so there is no positional
   // for these variadic flags to swallow.
-  args.push(...CLI.disallowedTools(FORBIDDEN_TOOLS))
+  args.push(...CLI.disallowedTools([...FORBIDDEN_TOOLS, ...hostWorkspaceToolsFor("claude_code", job)]))
 
   return args
 }

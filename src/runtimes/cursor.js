@@ -58,6 +58,33 @@ import {
 //    repository. Writing into a folder somebody shared with us to read is not
 //    something to do quietly, so the system text is prepended to the prompt
 //    instead. Nothing is written into the user's repo or into their ~/.cursor.
+//
+// ── A bot turn with no checkout: what it still has, and why ────────────────
+//
+// Claude Code, Gemini CLI, Grok, Codex and CodeWhale take their own file and
+// shell tools off a bot (Autopilot) turn that has no workdir — that turn
+// calls the platform's tools as [[TOOL:...]] markers (`text_protocol`), and a
+// scheduled bot whose CLI kept a second protocol spent its run reading the
+// laptop's disk. Cursor is left as it is, ON PURPOSE, because no mechanism
+// here is safe to ship:
+//
+//   * there is no tool-removal flag — permissions live in cli-config.json;
+//   * the one token spelling a probe proved on a real build is the exact
+//     `Shell(<command>)` deny. Read and write tokens, and whether a glob
+//     `Shell(... *)` matches at all, have never been read off a build — a
+//     guessed entry is inert and reads as coverage, and an entry the CLI
+//     rejects could cost it the whole permissions file, the deny list for a
+//     repository turn's --force included.
+//
+// What the turn runs with is the plain-chat posture: no --force and no
+// --workspace, so shell commands and file writes are not force-allowed, and
+// a headless run has nobody to approve them — the model can still reach for
+// them and spend a step doing it. Nothing here gates reads, so Cursor's read,
+// ls and grep tools stay live on a bot turn. `limitations` says so, and a
+// test pins the posture so --force cannot drift onto these turns. When a
+// real build shows which token denies the read tools, it goes into
+// permissionsFor gated on shared.js#hostWorkspaceOff, and
+// HOST_WORKSPACE_TOOLS.cursor stops being empty.
 // ---------------------------------------------------------------------------
 
 const CLI = {
@@ -599,7 +626,10 @@ export const cursor = {
     "Cursor's own web search is not removed from the run — prefer the " +
       "mcp__cma_web__* tools, which need no approval.",
     "A repository turn runs with every shell command allowed except the denied " +
-      "git commands, inside Cursor's sandbox — wider than Claude Code's git-only allowance."
+      "git commands, inside Cursor's sandbox — wider than Claude Code's git-only allowance.",
+    "A bot turn with no repository keeps Cursor's own read tools — no verified permission " +
+      "token removes them. Its shell and writes are not force-allowed there, and a headless " +
+      "run has nobody to approve them."
   ],
 
   classifyFailure: (detail, context = {}) =>

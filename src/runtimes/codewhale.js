@@ -2,8 +2,8 @@ import fs from "node:fs"
 import path from "node:path"
 
 import {
-  classifyFailure, emptyUsage, envForGithub, envForWeb, locateBin, locationAdvice,
-  mcpServersFor, shortCommand, shortPath
+  classifyFailure, emptyUsage, envForGithub, envForWeb, HOST_WORKSPACE_TOOLS, locateBin,
+  locationAdvice, mcpServersFor, shortCommand, shortPath
 } from "./shared.js"
 
 // ---------------------------------------------------------------------------
@@ -133,7 +133,15 @@ export const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"])
 
 // The native tools a plain chat cannot use anyway (no shared folder, no
 // `--auto`), so they should not cost schema tokens or denied steps.
-export const CHAT_DISALLOWED_TOOLS = ["read", "write", "edit", "bash", "agent"]
+//
+// The file and shell names are shared.js's HOST_WORKSPACE_TOOLS.codewhale —
+// the list every runtime keeps of what a bot turn with no checkout must not
+// have. CodeWhale needs no separate bot-turn branch for them: this list
+// already comes off EVERY turn without a workdir, and a bot turn (the job's
+// `text_protocol`) with no checkout is one of those, so it runs with the
+// platform's [[TOOL:...]] markers as its only protocol. Kept as one list so
+// the two cannot drift: narrowing the shared one narrows this, visibly.
+export const CHAT_DISALLOWED_TOOLS = [...HOST_WORKSPACE_TOOLS.codewhale, "agent"]
 
 // The outcomes CodeWhale itself exits non-zero on (exec_agent.rs). Anything
 // else in `meta.status` is a run that finished with an answer.

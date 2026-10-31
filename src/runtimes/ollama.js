@@ -33,6 +33,14 @@ import { classifyFailure, emptyUsage, locateBin, normalizeUsage } from "./shared
 // why `limitations` says so out loud and the web app repeats it at the point
 // where somebody picks this runtime.
 //
+// It is also why a bot turn needs nothing taken off here. The CLI runtimes
+// drop their own file and shell tools from a bot turn with no checkout
+// (shared.js HOST_WORKSPACE_TOOLS), so the platform's [[TOOL:...]] markers
+// are its only protocol; on Ollama they already are, because buildRequest
+// never sends a `tools` key — even to a model whose capabilities list tools.
+// A test pins that, so a future native-tools change has to decide this
+// explicitly rather than inherit it.
+//
 // Vision, on the other hand, it CAN do: /api/chat takes base64 images per
 // message, and the open-weight vision families (qwen2.5vl, llava,
 // llama3.2-vision, gemma4, …) run here. The server sends image parts only for

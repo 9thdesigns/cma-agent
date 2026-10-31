@@ -609,6 +609,28 @@ isolated — that directory is yours, and moving your work somewhere else would 
 a surprise. Point two sessions at one shared folder and they will collide, the
 same as two terminals would.
 
+### Old workspaces are tidied, so a long-paired laptop stays fast
+
+A working tree per session adds up: months of local sessions used to leave
+hundreds of full checkouts under `~/.configure-my-ai/workspaces`, gigabytes
+of files nobody would open again, and a machine that got slower the longer
+the companion was paired. The companion now sweeps that directory once a day
+(and once at startup), on two rules that both have to hold:
+
+* **Old** — the workspace hasn't been used for `CMA_TIDY_DAYS` (14 by
+  default). Every job that runs in a workspace refreshes its clock.
+* **Provably safe** — a tree with uncommitted or untracked files is never
+  touched, whatever its age; neither is one sitting on a commit no branch
+  holds. Branches live in the shared clone and survive their working tree,
+  so what goes is only files git can reproduce. Anything the companion
+  cannot verify — it stays.
+
+The shared clone each tree hangs off is kept four times as long, and only
+removed when no working tree references it, nothing is uncommitted or
+stashed, and no local branch holds a commit the remote lacks. Folders you
+shared yourself (`repos:add`) and the Desktop workspaces are yours and are
+never tidied. `CMA_TIDY_DAYS=0` turns the whole sweep off.
+
 ### A run is bounded by silence, not by duration
 
 There is no "maximum run length" setting, on purpose. Every value we tried was
@@ -657,6 +679,7 @@ distinguish a long run from a dead one — buffering emits nothing until the end
 | `CMA_GEMINI_BIN` | The same, for `gemini` |
 | `CMA_OLLAMA_URL` | Where Ollama listens, when it isn't `http://127.0.0.1:11434` — a container, or another box on your network. Takes precedence over `OLLAMA_HOST`, which is also read (and whose bind-address forms, `0.0.0.0:11434` and a bare port, are understood). Setting this also makes the runtime count as present even with no `ollama` binary on this machine |
 | `CMA_OLLAMA_KEEP_ALIVE` | How long Ollama keeps a model loaded after a run (default `30m`; Ollama's own default is 5 minutes, so the turn after a longer pause used to pay the whole model load again before its first token). A Go duration (`10m`, `24h`) or seconds as a number; `-1` keeps the model loaded until Ollama stops, `0` restores unload-immediately for a RAM-tight machine |
+| `CMA_TIDY_DAYS` | How many days an unused session working tree is kept before the daily sweep removes it (default 14; the shared clone it hangs off is kept 4× as long). Only workspaces this companion created, and only when provably safe — nothing uncommitted, untracked, stashed or unpushed is ever removed. `0` disables tidying entirely |
 | `CMA_IDLE_TIMEOUT_MS` | How long a run may produce **no output** before it is stopped (default 600000 — 10 min, which clears the longest single Bash tool call). This is a silence budget, not a duration budget — a run that keeps streaming never hits it, however long it takes |
 | `CMA_MAX_RUN_MS` | Backstop for a wedged process that is somehow still emitting (default 4 h). Not a budget for real work |
 

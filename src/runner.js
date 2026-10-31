@@ -10,6 +10,7 @@ import {
 import { getRuntime, installedRuntimes, isInstalled, RUNTIMES } from "./runtimes/index.js"
 import { loginCommand } from "./runtimes/shared.js"
 import { resolveRepo, runCommand, COMMANDS } from "./repos.js"
+import { tidyWorkspaces, TIDY_EVERY_MS } from "./tidy.js"
 import * as hosted from "./hosted.js"
 import { classifySubscription, isHosted, LOGIN_KINDS } from "./hosted_status.js"
 import { VERSION } from "./version.js"
@@ -205,6 +206,15 @@ export async function start({ log = console.log } = {}) {
   const heartbeatTimer = setInterval(beat, HEARTBEAT_MS)
   const rescanTimer = setInterval(rescan, RESCAN_MS)
 
+  // Old workspaces are what makes a laptop that ran local sessions for
+  // months slower than the day it was paired — see src/tidy.js for what is
+  // removed and the proofs required first. Once at startup (a laptop may
+  // never stay up a whole day) and then daily; never awaited, because a
+  // disk sweep must not delay the first job.
+  const tidy = () => tidyWorkspaces({ log }).catch(() => {})
+  tidy()
+  const tidyTimer = setInterval(tidy, TIDY_EVERY_MS)
+
   log(`Waiting for work — up to ${limits.jobs} at a time. Leave this running.`)
 
   // Two independent pollers over the same queue. Both stop when `running`
@@ -226,6 +236,7 @@ export async function start({ log = console.log } = {}) {
   } finally {
     clearInterval(heartbeatTimer)
     clearInterval(rescanTimer)
+    clearInterval(tidyTimer)
     supervisor?.stop()
   }
 

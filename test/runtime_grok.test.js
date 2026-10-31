@@ -2,8 +2,11 @@ import test from "node:test"
 import assert from "node:assert/strict"
 
 import {
-  grok, effortArg, EFFORT_LEVELS, fallbackJob, resumePlan, renderPrompt, streamingArgs
+  grok, effortArg, EFFORT_LEVELS, fallbackJob, HOST_WORKSPACE_RULES, permissionArgs, resumePlan,
+  renderPrompt, streamingArgs
 } from "../src/runtimes/grok.js"
+import { withoutCapabilityFlags } from "../src/engine.js"
+import { HOST_WORKSPACE_TOOLS } from "../src/runtimes/shared.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures. Every line below is the documented `--output-format streaming-json`
@@ -174,7 +177,9 @@ test("the model label is the row that did the work, and the CLI's own caveats be
       } }
   ])
   assert.equal(out.usage.model_label, "grok-4.6")
-  assert.equal(out.stopReason, "max_turn_requests")
+  // The turn ceiling reads as the server's one word for it, so the step-limit
+  // line is appended (Code::GenerateResponseJob#step_limit_apology).
+  assert.equal(out.stopReason, "max_turns")
   assert.equal(out.warnings.length, 2)
   assert.match(out.warnings[0], /turn limit/)
   assert.match(out.warnings[1], /incomplete/)
@@ -420,4 +425,54 @@ test("thought text is never collected as the answer", () => {
   assert.equal(out.content, "")
   assert.equal(grok.partialThoughtFrom({ type: "thought", data: { data: "the user probably wants X" } }),
                "the user probably wants X")
+})
+
+// ---------------------------------------------------------------------------
+// A bot turn with no checkout: one protocol
+// ---------------------------------------------------------------------------
+
+// A bot turn calls the platform's tools as [[TOOL:...]] markers. A Grok chat
+// runs --yolo under a read-only sandbox, which stops writes and not reads, so
+// grok's own read_file and shell ran unasked on the laptop's disk — the way a
+// scheduled bot spent its whole run instead of shipping anything.
+test("a bot turn with no checkout gets one protocol: grok's file and shell tools are denied", () => {
+  const denied = (args) => args.filter((arg, i) => args[i - 1] === "--deny")
+  const disallowed = (args) => String(args[args.indexOf("--disallowed-tools") + 1] || "").split(",")
+
+  const bot = streamingArgs({ text_protocol: true }, "go")
+  for (const rule of ["Read(**)", "Grep(**)", "Edit(**)", "Write(**)", "Bash(*)"]) {
+    assert.ok(denied(bot).includes(rule), `${rule} must be denied on a bot turn`)
+  }
+  for (const tool of ["read_file", "grep", "list_dir", "search_replace", "run_terminal_cmd"]) {
+    assert.ok(disallowed(bot).includes(tool), `${tool} must be off a bot turn`)
+  }
+  // One flag carrying both lists, not a second --disallowed-tools a build
+  // might read as replacing the first.
+  assert.equal(bot.filter((arg) => arg === "--disallowed-tools").length, 1)
+  assert.ok(disallowed(bot).includes("web_search"), "the every-job built-ins still ride")
+  assert.equal(bot.at(-1), "go", "the prompt stays last")
+
+  // A plain chat has no checkout either: the same --yolo read the same disk.
+  const chat = streamingArgs({}, "go")
+  for (const rule of ["Read(**)", "Grep(**)", "Bash(*)"]) {
+    assert.ok(denied(chat).includes(rule), `${rule} must be denied on a plain chat`)
+  }
+  assert.ok(disallowed(chat).includes("read_file"))
+
+  const repo = streamingArgs({ text_protocol: true, workdir: "/tmp/repo" }, "go")
+  assert.ok(!denied(repo).includes("Read(**)"), "a turn in a checkout keeps its file tools")
+  assert.ok(!denied(repo).includes("Bash(*)"), "and its shell")
+  assert.ok(!disallowed(repo).includes("read_file"))
+})
+
+test("grok's bot-turn denies come from one place and survive a degraded retry", () => {
+  const args = permissionArgs({ text_protocol: true })
+  for (const rule of HOST_WORKSPACE_RULES) assert.ok(args.includes(rule), `${rule} must ride --deny`)
+  const disallowed = args[args.indexOf("--disallowed-tools") + 1].split(",")
+  for (const tool of HOST_WORKSPACE_TOOLS.grok) assert.ok(disallowed.includes(tool), `${tool} must be off`)
+
+  // --yolo stays on a degraded retry; so must the denies that bound it.
+  const stripped = withoutCapabilityFlags(streamingArgs({ text_protocol: true }, "go"))
+  assert.ok(stripped.includes("Read(**)"))
+  assert.ok(stripped.includes("Bash(*)"))
 })

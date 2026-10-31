@@ -255,6 +255,22 @@ test("the composer's step budget is the CLI's turn ceiling; Unlimited sends noth
   assert.ok(!baseArgs({}).includes("--max-turns"))
 })
 
+// A bot turn calls the platform's tools as [[TOOL:...]] markers. Leaving the
+// CLI's own file and shell tools live beside them let a scheduled bot spend
+// its whole run on the laptop's disk instead of shipping anything.
+test("a bot turn with no checkout gets one protocol: the CLI's file and shell tools are off", () => {
+  const denied = (args) => args.slice(args.indexOf("--disallowedTools") + 1)
+
+  const bot = denied(baseArgs({ text_protocol: true }))
+  for (const tool of ["Read", "Glob", "Grep", "Bash", "Write", "Edit"]) {
+    assert.ok(bot.includes(tool), `${tool} must be off a bot turn`)
+  }
+
+  assert.ok(!denied(baseArgs({})).includes("Read"), "a plain chat keeps what it had")
+  const repo = baseArgs({ text_protocol: true, workdir: "/tmp/repo" })
+  assert.ok(!denied(repo).includes("Read"), "a turn in a checkout keeps its file tools")
+})
+
 test("plan usage is read defensively and dropped when the event carries nothing usable", () => {
   assert.equal(planUsageFrom({ type: "rate_limit_event" }), null)
   assert.equal(planUsageFrom({ rate_limit_info: "nope" }), null)

@@ -59,6 +59,32 @@ import {
 // command (src/repos.js) ships the work, as it does for Gemini CLI. No MCP
 // wiring: agy discovers MCP servers from its own config directory, and the
 // mechanism to relocate that directory is unverified.
+//
+// ── A bot turn with no checkout: left as it is, and why ────────────────────
+//
+// Claude Code, Gemini CLI, Grok, Codex and CodeWhale take their own file and
+// shell tools off a bot (Autopilot) turn with no workdir — that turn calls
+// the platform's tools as [[TOOL:...]] markers (`text_protocol`), and a
+// scheduled bot whose CLI kept a second protocol spent its run reading the
+// laptop's disk. agy gets no such change, because it offers no safe way:
+//
+//   * no flag removes a tool — the flag table above is the whole surface,
+//     and the same gap is why read_url and search_web stay on (limitations);
+//   * the permission rules agy reads live in
+//     ~/.gemini/antigravity-cli/settings.json, the user's own file, which
+//     this companion never writes (see "Writes" above) — and only the allow
+//     side of them has ever been seen in a capture;
+//   * custom agents with their own `tools` list exist (CHANGELOG), but
+//     defining one means writing into that same directory, and selecting one
+//     from print mode has never been exercised here.
+//
+// What a bot turn already runs with is the plain-chat posture: no
+// --mode=accept-edits, no --add-dir, never --dangerously-skip-permissions. So
+// write_file and run_command are permission-gated with nobody to approve
+// them, and headless mode auto-denies them (`denied_actions`). The read
+// tools (view_file and its siblings) are not gated that way and stay live;
+// that is stated in `limitations`, and a test pins the posture so a grant
+// cannot drift onto these turns.
 // ---------------------------------------------------------------------------
 
 const CLI = {
@@ -781,7 +807,9 @@ export const antigravity = {
       "other coding runtime here mounts them.",
     "One Antigravity login per machine.",
     "agy's own web tools (read_url, search_web) stay on the surface — there is no flag to remove " +
-      "them; headless mode auto-denies the permission-gated ones, after the model has asked."
+      "them; headless mode auto-denies the permission-gated ones, after the model has asked.",
+    "A bot turn with no repository keeps agy's own read tools for the same reason — no flag " +
+      "removes them. Its writes and commands are auto-denied there, as in any headless chat."
   ],
 
   resolveBin() {

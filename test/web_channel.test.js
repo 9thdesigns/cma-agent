@@ -16,7 +16,7 @@ import os from "node:os"
 import path from "node:path"
 
 import { baseArgs } from "../src/runtimes/claude-code.js"
-import { baseArgs as geminiArgs } from "../src/runtimes/gemini.js"
+import { baseArgs as geminiArgs, excludedToolsFor, systemSettingsFor } from "../src/runtimes/gemini.js"
 import { cursor, writeConfig } from "../src/runtimes/cursor.js"
 import { RUNTIMES } from "../src/runtimes/index.js"
 import { withoutCapabilityFlags } from "../src/engine.js"
@@ -210,19 +210,24 @@ test("Gemini's own web tools are excluded, in every job shape", () => {
   // Gemini only passed it for a repository turn, so a chat turn was doubly
   // uncovered.
   for (const job of [{ model: "gemini-3-pro-preview" }, { model: "x", workdir: "/repo" }]) {
-    const excluded = valueOf(geminiArgs(job), "--exclude-tools")
-    assert.ok(excluded, "--exclude-tools must be passed")
     // The web tools first, then the platform-owned built-ins (memory is the
     // bot's, through memory_update) — see shared.js BUILTIN_PLATFORM_TOOLS.
-    assert.deepEqual(excluded.split(","), ["google_web_search", "web_fetch", "save_memory"])
+    // They ride the settings shim's tools.exclude (gemini.js excludedToolsFor).
+    assert.deepEqual(excludedToolsFor(job), ["google_web_search", "web_fetch", "save_memory"])
+    assert.deepEqual(systemSettingsFor({ ...job, web: WEB }).tools.exclude.slice(-3),
+      ["google_web_search", "web_fetch", "save_memory"])
   }
 })
 
-test("Gemini's exclusion never costs the turn if a build rejects the flag", () => {
+test("Gemini's exclusion never costs the turn", () => {
   // The rule this codebase already learned twice: a flag we added must not be
-  // able to kill a run. --exclude-tools has to be strippable like the rest.
-  assert.ok(withoutCapabilityFlags(geminiArgs({ model: "x", workdir: "/repo" }))
-    .every((arg) => arg !== "--exclude-tools" && !arg.includes("google_web_search")))
+  // able to kill a run. Gemini CLI's main command has no --exclude-tools, so
+  // it is never on argv at all — sent, it failed every turn's first spawn.
+  for (const job of [{ model: "x" }, { model: "x", workdir: "/repo" }, { model: "x", text_protocol: true }]) {
+    assert.ok(geminiArgs(job).every((arg) => arg !== "--exclude-tools" && !arg.includes("google_web_search")))
+  }
+  assert.deepEqual(withoutCapabilityFlags(geminiArgs({ model: "x" })), geminiArgs({ model: "x" }),
+    "a plain chat carries no capability flag to lose")
 })
 
 test("Cursor's uncovered web tools are stated rather than guessed at", () => {

@@ -127,7 +127,7 @@ const TOOLS = [
   {
     name: "pr_open",
     description:
-      "Ship the work: commit this checkout's working tree onto `head`, push it, and open the pull request — all three, in one call. Do NOT run git yourself first. If a pull request for that branch is already open, its title and body are updated instead of failing.",
+      "Ship the work: commit this checkout's working tree onto `head`, push it, and open the pull request — all three, in one call. Do NOT run git yourself first. If a pull request for that branch is already open, its title and body are updated instead of failing. With NO checkout on this machine, pass `files` instead: their full contents are committed onto `head` (created from the base if needed) and the pull request opens.",
     inputSchema: {
       type: "object",
       properties: {
@@ -135,7 +135,16 @@ const TOOLS = [
         body: { type: "string", description: "Markdown description." },
         head: { type: "string", description: "Branch to commit, push and open the PR from. Defaults to this session's working branch." },
         base: { type: "string", description: "Branch to merge into. Defaults to the session base branch." },
-        draft: { type: "boolean", description: "Open as a draft." }
+        draft: { type: "boolean", description: "Open as a draft." },
+        files: {
+          type: "array",
+          description: "Only when this run has no checkout: every file to commit, each with its FULL new content. With a checkout, leave this out — the working tree is what gets committed.",
+          items: {
+            type: "object",
+            properties: { path: { type: "string" }, content: { type: "string" } },
+            required: ["path", "content"]
+          }
+        }
       },
       required: ["title"]
     }

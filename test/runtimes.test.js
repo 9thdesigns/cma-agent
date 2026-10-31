@@ -27,7 +27,10 @@ import {
   grok, accountFromAuth as grokAccountFromAuth, configTomlFor as grokConfigTomlFor
 } from "../src/runtimes/grok.js"
 import { ollama } from "../src/runtimes/ollama.js"
-import { GIT_VERBS, FORBIDDEN_GIT, lastTurnOccupancy, occupancyOf } from "../src/runtimes/shared.js"
+import {
+  GIT_VERBS, FORBIDDEN_GIT, HOST_WORKSPACE_TOOLS, hostWorkspaceOff, hostWorkspaceToolsFor,
+  lastTurnOccupancy, occupancyOf
+} from "../src/runtimes/shared.js"
 import { withoutCapabilityFlags } from "../src/engine.js"
 
 const REPO_JOB = {
@@ -86,6 +89,20 @@ test("runtime ids match what the server stores", () => {
   assert.deepEqual(runtimeIds(),
     ["claude_code", "cursor", "codex", "gemini_cli", "antigravity", "grok", "codewhale", "ollama"])
   assert.equal(DEFAULT_RUNTIME, "claude_code")
+})
+
+// A bot turn with no checkout runs one protocol — the platform's [[TOOL:...]]
+// markers — on every runtime. A runtime missing from the map would take
+// nothing off and say nothing about it, which is how the gap stayed open on
+// all but two of them after the scheduled-bot incident.
+test("every runtime answers for its file and shell tools on a bot turn with no checkout", () => {
+  assert.deepEqual(Object.keys(HOST_WORKSPACE_TOOLS).sort(), [...runtimeIds()].sort())
+
+  assert.equal(hostWorkspaceOff({ text_protocol: true }), true)
+  assert.equal(hostWorkspaceOff({}), false, "a plain chat keeps what it had")
+  assert.equal(hostWorkspaceOff({ text_protocol: true, workdir: "/repo" }), false, "a checkout keeps its tools")
+  assert.deepEqual(hostWorkspaceToolsFor("grok", { text_protocol: true, workdir: "/repo" }), [])
+  assert.deepEqual(hostWorkspaceToolsFor("not_a_runtime", { text_protocol: true }), [])
 })
 
 test("an unknown runtime resolves to null, and a missing one to the default", () => {
@@ -637,7 +654,9 @@ test("stripping capability flags leaves each runtime a runnable argv", () => {
     if (runtime.promptOnStdin) {
       assert.ok(!stripped.includes("the prompt"), `${runtime.id} must keep the prompt off argv`)
     } else {
-      assert.ok(stripped.includes("the prompt"), `${runtime.id} lost its prompt`)
+      // Gemini sends it as one `--prompt=` token (gemini.js CLI.prompt).
+      assert.ok(stripped.includes("the prompt") || stripped.includes("--prompt=the prompt"),
+        `${runtime.id} lost its prompt`)
     }
   }
 })
@@ -686,7 +705,9 @@ test("the Codex prompt rides stdin, and `-` stays last so nothing can swallow it
 test("a Codex repository turn opens the sandbox's network for git, a chat does not", () => {
   const repo = codex.streamingArgs(REPO_JOB)
   assert.equal(repo[repo.indexOf("-c") + 1], "sandbox_workspace_write.network_access=true")
-  assert.ok(!codex.streamingArgs(CHAT_JOB).includes("-c"))
+  // A chat does carry `-c` now (its shell comes off — hostWorkspaceConfig),
+  // but never the network.
+  assert.ok(!codex.streamingArgs(CHAT_JOB).includes("sandbox_workspace_write.network_access=true"))
 })
 
 test("Codex's config.toml names the MCP servers and carries no secret", () => {
@@ -937,7 +958,10 @@ test("Grok's tool calls produce the same ticker lines", () => {
   assert.equal(line({ type: "tool_call", toolName: "bash", kind: "execute", rawInput: { command: "cd /r && git status" } }),
                "Running git status")
   assert.equal(line({ type: "tool_call", toolName: "grep", kind: "search", rawInput: {} }), "Searching the code")
-  assert.equal(line({ type: "thought", data: "hmm" }), "Thinking")
+  // Reasoning is not a ticker word any more — it rides the thinking log as
+  // its own text (see partialThoughtFrom), the way a Claude turn's does.
+  assert.equal(line({ type: "thought", data: "hmm" }), null, "reasoning is the log's business, not the ticker's")
+  assert.equal(grok.partialThoughtFrom({ type: "thought", data: "hmm" }), "hmm")
   assert.equal(line({ type: "text", data: "the answer" }), null, "the answer is not a step")
 })
 

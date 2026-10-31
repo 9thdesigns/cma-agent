@@ -641,7 +641,12 @@ const CAPABILITY_FLAGS = new Set([
   // NOT here: stripping it would leave a resumed turn's prompt — the new
   // message alone — with no history behind it; a resume that fails is
   // retried by the adapter's fallbackJob instead, with the full history.
-  "--effort"
+  "--effort",
+  // grok (and claude_code): the composer's step cap. A Grok build older than
+  // the flag would otherwise fail EVERY turn on an option we added; without
+  // it the turn runs uncapped, still bounded by the server's run deadline
+  // and this companion's silence timeout.
+  "--max-turns"
 ])
 
 function rejectedCapabilityFlag(stderr) {
