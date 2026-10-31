@@ -21,7 +21,7 @@ import {
   ollama, buildRequest, usageFrom, thinkFor, numCtxFor,
   rememberModelMeta, forgetModelMeta, knownModelMeta, CLOUD_MODEL_ID
 } from "../src/runtimes/ollama.js"
-import { occupancyOf } from "../src/runtimes/shared.js"
+import { HOST_WORKSPACE_TOOLS, occupancyOf } from "../src/runtimes/shared.js"
 import { runCompletion } from "../src/engine.js"
 import { runtimeCatalogue, MODEL_META_KEY } from "../src/profiles.js"
 
@@ -259,6 +259,27 @@ test("think reaches the request body, and an untouched dial leaves the body as i
     assert.equal("think" in buildRequest(JOB).body, false, "Standard sends nothing")
     assert.equal("think" in buildRequest({ ...JOB, model: "llama3.2:3b", effort: "high" }).body, false,
       "an undescribed model keeps the server default")
+  } finally {
+    forgetModelMeta()
+  }
+})
+
+// The CLI runtimes take their own file and shell tools off a bot turn with no
+// checkout, so the platform's [[TOOL:...]] markers are its only protocol.
+// Ollama never had a second one to take off: the request carries no `tools`,
+// even for a model that lists the capability. Pinned, so adding native tools
+// here has to decide what a bot turn gets rather than inherit it.
+test("a bot turn on Ollama has one protocol already: the request never carries tools", () => {
+  forgetModelMeta()
+  rememberModelMeta({ "qwen3:8b": { capabilities: ["completion", "tools", "thinking"] } })
+
+  try {
+    for (const job of [{ ...JOB, text_protocol: true }, JOB, { ...JOB, text_protocol: true, workdir: "/tmp/repo" }]) {
+      const { body } = buildRequest(job)
+      assert.equal("tools" in body, false)
+      assert.equal("tool_choice" in body, false)
+    }
+    assert.deepEqual(HOST_WORKSPACE_TOOLS.ollama, [], "nothing to take off")
   } finally {
     forgetModelMeta()
   }

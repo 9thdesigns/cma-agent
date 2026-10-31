@@ -3,8 +3,8 @@ import os from "node:os"
 import path from "node:path"
 
 import {
-  classifyFailure, emptyUsage, envForGithub, envForWeb, locateBin, locationAdvice, loginCommand,
-  maskAccount, mcpServersFor, normalizeUsage, shortCommand, shortPath
+  classifyFailure, emptyUsage, envForGithub, envForWeb, locateBin, locationAdvice,
+  loginCommand, maskAccount, mcpServersFor, normalizeUsage, shortCommand, shortPath
 } from "./shared.js"
 
 // ---------------------------------------------------------------------------
@@ -32,7 +32,7 @@ import {
 // IS the whole permission story. That maps cleanly onto ours:
 //
 //   repository turn  --full-auto            edits confined to the workspace
-//   plain chat       --sandbox read-only    answers, writes nothing
+//   plain chat       --sandbox read-only    answers, writes nothing, no shell
 //
 // `--skip-git-repo-check` is passed on repository turns because the trust
 // decision it asks about has already been made — the directory was
@@ -48,6 +48,19 @@ import {
 // coverage. So a codex repository turn is bounded by the workspace-write
 // sandbox and the system prompt's rules, and `limitations` says so instead
 // of pretending otherwise.
+//
+// ── A turn with no checkout ────────────────────────────────────────────────
+//
+// A bot (Autopilot) turn calls the platform's tools as [[TOOL:...]] markers
+// in its reply (the job says so with `text_protocol`). The read-only sandbox
+// a chat already runs under makes codex's writes inert — apply_patch has
+// nothing it may write to — but NOT its reads: the shell tool still runs
+// `cat`, `ls` and `rg` anywhere on the disk, and that is how a scheduled bot
+// on a paired machine spent its whole run browsing the laptop instead of
+// doing the job. A plain chat had the same shell for the same reason. Codex
+// has no per-tool deny flag, so the tools come off at the source instead,
+// with config keys over `-c`, on every turn without a checkout (see
+// hostWorkspaceConfig).
 // ---------------------------------------------------------------------------
 
 const CLI = {
@@ -119,6 +132,53 @@ export function resumeThreadId(job) {
   return THREAD_ID.test(id) ? id : null
 }
 
+// ---------------------------------------------------------------------------
+// The host's file and shell tools, off every turn with no checkout.
+//
+// Two `[features]` keys, each a dotted `-c` override. Read off codex-rs on
+// main (2026-10-14), not exercised against a binary from here:
+//
+//   features.shell_tool=false  FeatureSpec "shell_tool", Stage::Stable,
+//                              default on (codex-rs/features/src/lib.rs).
+//                              With it off, add_shell_tools in
+//                              core/src/tools/spec_plan.rs returns before
+//                              registering exec_command / write_stdin / the
+//                              shell, so the tool is never in the schema the
+//                              model is handed — not refused, absent.
+//   features.view_image=false  the same file and stage: the built-in viewer
+//                              that reads an image off a local path.
+//
+// Why this is safe to send on a build that does not know a key: an unknown
+// feature key is `tracing::warn!("unknown feature key in config")`, not an
+// error, and exec's `--strict-config` ("Error out when config.toml contains
+// fields that are not recognized", exec/src/cli.rs) exists because the
+// default is to accept them — this adapter never passes it. `-c` itself is
+// the override every repository turn already rides
+// (sandbox_workspace_write.network_access), so no new FLAG reaches argv —
+// the one thing that can fail a whole run at parsing.
+//
+// apply_patch is left alone on purpose: it is registered off the model's own
+// metadata, not a feature, and under `--sandbox read-only` it has nothing it
+// may write to.
+//
+// The keys go on EVERY turn with no checkout — a plain chat as well as a bot
+// turn — not only where shared.js#hostWorkspaceOff says (that also asks for
+// `text_protocol`). 0.27.1 took the shell off the bot turn and left a chat
+// typed into the web app, on a Codex login, with exactly the shell the bot
+// had lost: `--sandbox read-only` stops writes, not `cat ~/.aws/credentials`,
+// and exec mode never stops to ask. A chat completion has no folder to work
+// in, so the only thing that shell could ever read is a file nobody shared.
+// A code session in a checkout is untouched: it keeps its shell under
+// --full-auto, exactly as before.
+// ---------------------------------------------------------------------------
+
+export const HOST_WORKSPACE_FEATURES = ["shell_tool", "view_image"]
+
+export function hostWorkspaceConfig(job) {
+  if (job?.workdir) return []
+  return HOST_WORKSPACE_FEATURES.map((feature) => `features.${feature}=false`)
+}
+
 export function baseArgs(job) {
   const args = []
   if (job.model) args.push(...CLI.model(job.model))
@@ -138,6 +198,9 @@ export function baseArgs(job) {
     // it also needs no repo check because nothing touches a tree.
     args.push(...CLI.sandbox("read-only"))
     args.push(CLI.skipGitRepoCheck)
+    // And reads nothing off the disk either, bot turn or plain chat — see
+    // hostWorkspaceConfig.
+    for (const pair of hostWorkspaceConfig(job)) args.push(...CLI.config(pair))
   }
 
   const effort = effortFor(job)

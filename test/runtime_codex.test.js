@@ -13,7 +13,8 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 
 import {
-  codex, additiveUsage, effortFor, resumeThreadId, streamingArgs, renderPrompt, CODEX_CONTEXT_WINDOW
+  codex, additiveUsage, baseArgs, effortFor, hostWorkspaceConfig, resumeThreadId, streamingArgs,
+  renderPrompt, CODEX_CONTEXT_WINDOW
 } from "../src/runtimes/codex.js"
 import { withoutCapabilityFlags } from "../src/engine.js"
 
@@ -298,4 +299,48 @@ test("codex: structured message content is serialised on a resume, like the engi
   const messages = [{ role: "user", content: [{ type: "text", text: "hi" }] }]
   assert.equal(renderPrompt({ messages, runtime_session_id: "t1" }, "ignored"),
     JSON.stringify([{ type: "text", text: "hi" }]))
+})
+
+// ---------------------------------------------------------------------------
+// A bot turn with no checkout: one protocol
+// ---------------------------------------------------------------------------
+
+// A bot turn calls the platform's tools as [[TOOL:...]] markers. A chat's
+// read-only sandbox stops codex writing, not reading, so a scheduled bot
+// could still spend its whole run on `cat` and `rg` across the laptop's disk
+// instead of shipping anything. Codex has no per-tool deny; the shell comes
+// off at the source, as config.
+test("codex: a bot turn with no checkout gets one protocol: the shell and image viewer are off", () => {
+  const overrides = (args) => args.filter((arg, i) => args[i - 1] === "-c")
+
+  const bot = baseArgs({ text_protocol: true })
+  assert.ok(overrides(bot).includes("features.shell_tool=false"), "the shell must be off a bot turn")
+  assert.ok(overrides(bot).includes("features.view_image=false"), "so must the local image reader")
+  // Added to the posture it already had, never instead of it.
+  assert.equal(bot[bot.indexOf("--sandbox") + 1], "read-only")
+
+  // A plain chat has no checkout either, and the same shell read the disk.
+  assert.deepEqual(hostWorkspaceConfig({}), ["features.shell_tool=false", "features.view_image=false"],
+                   "a plain chat loses the shell too")
+  assert.ok(overrides(baseArgs({})).includes("features.shell_tool=false"))
+  const repo = overrides(baseArgs({ text_protocol: true, workdir: "/tmp/repo" }))
+  assert.ok(!repo.some((pair) => pair.startsWith("features.")), "a turn in a checkout keeps its shell")
+})
+
+test("codex: a bot turn's config rides before `resume`, and survives a degraded retry", () => {
+  // `codex exec [OPTIONS] resume <id> -`: options after the subcommand would
+  // be the subcommand's, not exec's.
+  const args = streamingArgs({
+    text_protocol: true, runtime_session_id: "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+    messages: [{ role: "assistant", content: "a" }, { role: "user", content: "b" }]
+  })
+  assert.ok(args.indexOf("resume") > 0)
+  assert.ok(args.indexOf("features.shell_tool=false") < args.indexOf("resume"))
+  assert.equal(args.at(-1), "-")
+
+  // `-c` is not a capability flag, so the engine never strips it: a build
+  // that rejects --sandbox still runs the bot turn without a shell.
+  const stripped = withoutCapabilityFlags(streamingArgs({ text_protocol: true }))
+  assert.ok(stripped.includes("features.shell_tool=false"))
+  assert.equal(stripped.at(-1), "-")
 })

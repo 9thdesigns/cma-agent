@@ -19,7 +19,7 @@ import {
   cliConfigFor, cursor, cursorOwnedAgent, cursorUsage, effortModel, EFFORT_VARIANTS,
   permissionsFor, resumeSessionId, writeConfig
 } from "../src/runtimes/cursor.js"
-import { FORBIDDEN_GIT } from "../src/runtimes/shared.js"
+import { FORBIDDEN_GIT, HOST_WORKSPACE_TOOLS } from "../src/runtimes/shared.js"
 
 const GITHUB = { token: "cmagh_secret", endpoint: "https://example.com/api/code/v1/github" }
 const WEB = { token: "cmagh_websecret", endpoint: "https://example.com/api/code/v1/web" }
@@ -356,6 +356,23 @@ test("writeConfig lands cli-config.json, owner-only, and clears the old permissi
 test("the adapter states the posture it actually runs with", () => {
   assert.ok(cursor.limitations.some((line) => /every shell command allowed except/.test(line)),
     "the width of a --force turn must be declared, not dressed up as an allow list")
+})
+
+// Every other tool-carrying runtime takes its own file and shell tools off a
+// bot turn with no checkout. Cursor has no verified way to (see the adapter's
+// header), so what it does have is pinned: the plain-chat posture, where
+// nothing is force-allowed, and the gap said out loud rather than covered by
+// a guessed permission token.
+test("a bot turn with no checkout keeps the chat posture, and the read-tool gap is stated", () => {
+  const bot = cursor.streamingArgs({ text_protocol: true })
+  for (const flag of ["--force", "--yolo", "--workspace", "--sandbox"]) {
+    assert.ok(!bot.includes(flag), `${flag} must never reach a bot turn with no checkout`)
+  }
+  assert.deepEqual(permissionsFor({ text_protocol: true }).permissions.allow, [])
+
+  assert.deepEqual(HOST_WORKSPACE_TOOLS.cursor, [], "no unverified token may read as coverage")
+  assert.ok(cursor.limitations.some((line) => /bot turn/.test(line) && /read tools/.test(line)),
+    "the read tools a bot turn keeps must be declared")
 })
 
 // ---------------------------------------------------------------------------

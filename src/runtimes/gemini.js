@@ -3,7 +3,7 @@ import path from "node:path"
 
 import {
   builtinPlatformTools, builtinWebTools, classifyFailure, emptyUsage, envForGithub, envForWeb, GITHUB_MCP_SERVER,
-  lastTurnOccupancy, locateBin, locationAdvice, mcpServersFor, normalizeUsage,
+  hostWorkspaceToolsFor, lastTurnOccupancy, locateBin, locationAdvice, mcpServersFor, normalizeUsage,
   shortCommand, shortPath
 } from "./shared.js"
 
@@ -27,6 +27,15 @@ import {
 //                        session uuid: "--resume {number}, --resume {uuid}, or
 //                        --resume latest". Mutually exclusive with
 //                        --session-id and --session-file.
+//
+// What is NOT there: an effort, thinking, reasoning or budget flag. None of
+// the 54 `.option(...)` names in the 0.64.0 bundle's yargs definitions (the
+// main command and its subcommands) is one, so this adapter sends the
+// composer's effort level nowhere — and the server's menu
+// knows it (Ai::Effort::RUNTIMES_WITHOUT_DIAL), so a Gemini composer shows no
+// dial instead of one whose every stop ran at the CLI's default.
+// test/services/ai/effort_menu_test reads this file: the day code here starts
+// sending a level, that test asks for the dial back.
 //
 // `auto_edit` is the direct analogue of Claude Code's `acceptEdits`:
 // auto-approve edit tools and nothing else. That correspondence is what makes
@@ -69,21 +78,49 @@ import {
 // in the machine's real system settings first — pointing the variable at our
 // file must not silently disable an enterprise policy file that was already
 // in force. Nothing is ever written into ~/.gemini or the repository.
+//
+// ── …and the door 0.60 closed ──────────────────────────────────────────────
+//
+// From Gemini CLI 0.60 (0.64.0's _doLoadSettings → loadSystemFile →
+// isFileAndDirectorySecureSync) a system settings file is read only when
+// root owns it and every directory above it, none of them writable by group
+// or others. Otherwise it is skipped whole, with "Security Warning: Skipping
+// system settings file '<path>': … is not owned by root (uid 0)" on stderr —
+// and our file lives in the companion's folder in the user's home, owned by
+// the user. Measured on the real 0.64.0 bundle: with the companion's folder
+// owned by an ordinary uid the shim is skipped and google_web_search and the
+// file tools are still declared to the model; with a root-owned chain the
+// same shim takes them off; 0.54.4 honours it either way. So on a current
+// Gemini CLI run by an ordinary account NOTHING in this file reaches the run
+// — not cma_github, not cma_web, not the exclusions — and, because the
+// variable REPLACES the machine's system file rather than adding to it, an
+// enterprise /etc/gemini-cli/settings.json goes unread on those runs too.
+// That needs a different door (a policy file on --policy for the exclusions;
+// something not under the system-settings check for the servers), and it is
+// said in `limitations` until there is one.
 // ---------------------------------------------------------------------------
 
 const CLI = {
-  prompt: (text) => ["--prompt", text],
+  // ONE token, `--prompt=<text>`, never `--prompt <text>`. The CLI's yargs
+  // gives --prompt nargs 1 with nargs-eats-options off, so a value that
+  // starts with "-" is read as the next FLAG, not as the prompt: a new
+  // message that opens with a markdown list ("- fix the login") or a flag
+  // name ("--verbose isn't working") died in argv parsing — exit 1, "Not
+  // enough arguments following: prompt" (real 0.64.0 bundle). That never
+  // bit while every prompt began with "<system>" or "User:"; a resumed turn
+  // sends the user's own words first (see renderPrompt), so it did. The `=`
+  // form is the one yargs never re-reads as a flag.
+  prompt: (text) => [`--prompt=${text}`],
   streamFormat: ["--output-format", "stream-json"],
   model: (id) => ["--model", id],
   // Only ever the session uuid — see resumeIdOf for what is kept off it.
   resume: (id) => ["--resume", id],
   approvalMode: (mode) => ["--approval-mode", mode],
   // Comma-separated, coerced by the CLI. One flag, one value — not variadic,
-  // so it cannot swallow anything.
-  allowedTools: (list) => ["--allowed-tools", list.join(",")],
-  // Same shape. --allowed-tools only auto-APPROVES; it removes nothing, so it
-  // is no help against a tool we want gone from the surface entirely.
-  excludeTools: (list) => ["--exclude-tools", list.join(",")]
+  // so it cannot swallow anything. It only auto-APPROVES; it removes
+  // nothing, so it is no help against a tool we want gone from the surface
+  // entirely — that is `tools.exclude` in the settings shim (excludedToolsFor).
+  allowedTools: (list) => ["--allowed-tools", list.join(",")]
 }
 
 // Gemini's own tool names, taken from the shipped bundle. Read and edit only —
@@ -110,6 +147,82 @@ export function resumeIdOf(job) {
   return id
 }
 
+// ---------------------------------------------------------------------------
+// Session continuity: what a resumed turn is SENT.
+//
+// `--resume <id>` reloads the whole recorded conversation into the chat
+// before the prompt is sent — runNonInteractive calls
+// geminiClient.resumeChat(convertSessionToClientHistory(messages)) and only
+// then emits `init` and sends `--prompt` (gemini-cli 0.64.0 bundle). Until
+// this, renderPrompt still rendered the ENTIRE conversation into that prompt,
+// so every resumed Gemini turn carried its history twice: once as the
+// session's real turns and once more as a "User: … Assistant: …" block
+// stacked on top of them, re-sent in full each turn and growing with it —
+// the continuity feature costing more than no continuity at all. The other
+// resuming adapters (claude-code.js plan.tail, codex.js, cursor.js
+// newMessagesSince, grok.js, antigravity.js) all send only what is new.
+//
+// The contract owner's rules (claude-code.js resumePlan), applied unchanged:
+//
+//   * the server decides WHETHER to offer an id — only when the system text
+//     is byte-identical to the one the session was recorded with, which is
+//     why a resumed prompt carries no <system> block: the first turn's
+//     prompt already holds it;
+//   * the id is one resumeIdOf accepts — never `latest` or an index;
+//   * the history must be an append-only continuation: at least one
+//     assistant turn the session already holds, then only user turns (the
+//     new message, plus the bot's hoisted clock band when there is one).
+//     Anything else is sent the old way, in full, with no --resume — a
+//     tail-only prompt on a session that does not hold the rest would be an
+//     answer to half a conversation;
+//   * a session that is gone exits before anything is spent, and
+//     fallbackJob retries the turn fresh, with the full history.
+// ---------------------------------------------------------------------------
+
+// { sessionId, tail } when this job may resume, null when it must not.
+export function resumePlan(job) {
+  const sessionId = resumeIdOf(job)
+  if (!sessionId) return null
+
+  const messages = Array.isArray(job.messages) ? job.messages : []
+  let lastAssistant = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "assistant") { lastAssistant = i; break }
+  }
+  if (lastAssistant < 0) return null
+
+  const tail = messages.slice(lastAssistant + 1)
+  if (tail.length === 0 || tail.some((m) => m?.role !== "user")) return null
+  return { sessionId, tail }
+}
+
+// One more attempt without the session, or null.
+//
+// The session-gone path is pinned from the CLI's own main (gemini-cli 0.64.0,
+// resolveSessionId): an id the project's chat store does not hold throws
+// SessionError — `Invalid session identifier "<id>"` — which is reported as
+// "Error resuming session: …" and ends the process with FATAL_INPUT_ERROR
+// (exit 42), all BEFORE runNonInteractive emits `init` or sends a byte to
+// the model. That is not a failed turn; it is the ordinary turn the person
+// would have got without the id (a different machine, a different working
+// tree, a cleaned chat store), and before this it reached them as an error
+// with nothing behind it. So: a planned resume that died without an `init`
+// (and without anything that could only follow one) is run again with the
+// id cleared — both spellings, since resumeIdOf reads both. Anything past
+// `init` was a real run with a real failure, and running it again in full
+// would pay for it twice; an argv rejection is the engine's own degrade path.
+const SPENT_EVENTS = new Set(["init", "message", "tool_use", "tool_result", "result"])
+
+export function fallbackJob(job, result = {}) {
+  if (!resumePlan(job)) return null
+
+  const events = Array.isArray(result.events) ? result.events : []
+  if (events.some((event) => SPENT_EVENTS.has(event?.type))) return null
+  if (/unknown option|unrecognized option|unknown argument/i.test(String(result.stderr || ""))) return null
+
+  return { ...job, runtime_session_id: null, runtimeSessionId: null }
+}
+
 export function baseArgs(job) {
   const args = [...CLI.streamFormat]
   if (job.model) args.push(...CLI.model(job.model))
@@ -120,23 +233,25 @@ export function baseArgs(job) {
   // The store is per project directory (Storage(cwd).getProjectTempDir()/
   // chats), so an id is only good from the same workdir on the same machine,
   // and an unknown id makes the CLI exit with a fatal input error rather
-  // than start fresh — the server must only send back what this device
-  // produced. Read defensively: an older server sends no such key.
-  const resume = resumeIdOf(job)
-  if (resume) args.push(...CLI.resume(resume))
+  // than start fresh — fallbackJob turns that into the fresh run. Only a
+  // turn resumePlan accepts resumes, because renderPrompt sends that turn
+  // only its tail. Read defensively: an older server sends no such key.
+  const plan = resumePlan(job)
+  if (plan) args.push(...CLI.resume(plan.sessionId))
 
-  // Gemini's own google_web_search and web_fetch, gone in EVERY job shape —
-  // not only a repository turn. The reasoning is the one that applies to any
-  // runtime here: a headless run has nobody to answer a permission prompt, so
-  // the CLI's own web tools can never succeed, and a tool the model can see
-  // beats a system prompt telling it not to reach for that tool. It should be
-  // reaching for mcp__cma_web__* instead, which needs no grant.
-  //
-  // --exclude-tools is registered in engine.js's CAPABILITY_FLAGS, so a build
-  // that does not parse it loses the exclusion rather than the whole turn.
-  const builtins = [...builtinWebTools("gemini_cli"), ...builtinPlatformTools("gemini_cli")]
-  if (builtins.length > 0) args.push(...CLI.excludeTools(builtins))
-
+  // No tool exclusions on argv, deliberately: they ride the settings shim as
+  // `tools.exclude` when one is written (excludedToolsFor says when that
+  // reaches the run). Gemini CLI's main command has never had an
+  // --exclude-tools option — the only one in the bundle belongs to `gemini
+  // mcp add` — in any release read for this (18 of them, 0.1.22 through
+  // 0.64.0), and its yargs is strict. So every Gemini turn sent with it died
+  // in argv parsing ("Unknown arguments: exclude-tools, excludeTools") and
+  // the engine re-ran it degraded: without --approval-mode auto_edit and
+  // --allowed-tools (on 0.64.0 a repository turn's model was not even
+  // offered write_file or replace), without the exclusions it was sent for,
+  // and — the reason this was found — with --resume still on, so a session
+  // that was gone failed in runDegraded, which never asks fallbackJob, and
+  // the person got "Error resuming session" instead of a fresh turn.
   if (job.workdir) {
     // Edits without prompting, nothing else. A headless run has no terminal to
     // approve in, so anything not auto-approved simply does not happen.
@@ -147,21 +262,32 @@ export function baseArgs(job) {
   return args
 }
 
-// The whole prompt travels as ONE argument. `--prompt` is nargs 1, so there is
-// no positional for anything to swallow and no ordering hazard of the kind
-// that killed an earlier Claude Code release.
+// The whole prompt travels as ONE argument, `--prompt=<text>` (see CLI.prompt
+// for why the `=` form), so there is no positional for anything to swallow
+// and no ordering hazard of the kind that killed an earlier Claude Code
+// release.
 //
-// Worth knowing: this puts the conversation in argv, so a very long history is
-// bounded by ARG_MAX (~2MB on Linux, ~1MB on macOS) rather than by the model's
-// context. The server compacts before it gets close.
+// Worth knowing: this puts the conversation in argv. On Linux one argument is
+// capped at 128 KiB (MAX_ARG_STRLEN) whatever the ~2MB ARG_MAX, and every
+// cloud machine is Linux; macOS has only the ~1MB total. The server keeps the
+// prompt under the per-argument cap for this runtime on a Linux machine
+// (Ai::LocalCompanionClient#argv_bounded).
 export function streamingArgs(job, prompt = "") {
   return [...CLI.prompt(prompt), ...baseArgs(job)]
 }
 
 // Gemini has no append-system-prompt flag either, so the system text rides the
 // prompt — kept visibly separated so a model reading it can tell the
-// operator's instructions from the conversation.
+// operator's instructions from the conversation. A resumed turn is fed only
+// the new user turn(s), verbatim and unframed: the session already holds
+// every earlier message, the system block included — see resumePlan.
 export function renderPrompt(job, conversation) {
+  const plan = resumePlan(job)
+  if (plan) {
+    return plan.tail
+      .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
+      .join("\n\n")
+  }
   if (!job.system) return conversation
   return `<system>\n${job.system}\n</system>\n\n${conversation}`
 }
@@ -194,6 +320,39 @@ function existingSystemSettings() {
   }
 }
 
+// Gemini's own tools this job takes off the surface, by Gemini's own names:
+// the web tools and the platform-owned built-ins on EVERY job (a headless run
+// has nobody to answer a permission prompt, and a tool the model can see
+// beats a system prompt telling it not to reach for it — it should be using
+// mcp__cma_web__* and the bot's memory_update), plus the file and shell tools
+// on a bot turn with no checkout (shared.js HOST_WORKSPACE_TOOLS).
+//
+// They travel as the shim's `tools.exclude`, the settings key every release
+// from 0.3.0 to 0.64.0 reads (0.64.0: mergeExcludeTools(settings) into the
+// config's excludeTools, plus a DENY rule per name in the policy engine,
+// which takes a denied tool out of the declarations the model is sent),
+// UNION-merged with the user's own list from 0.8.0 on. Not --exclude-tools:
+// see baseArgs for what that flag did to every turn.
+//
+// What this does NOT reach, stated rather than implied: the shim is only
+// written for a job with servers to mount (writeConfig), and Gemini CLI 0.60
+// and later skips it outright unless root owns it and every directory above
+// it — see the header. So the exclusions hold on a 0.3–0.59 build when the
+// job mounts cma_github or cma_web, and on any build for a companion running
+// as root; anywhere else Gemini keeps these tools, as it always has (the
+// argv flag never parsed). A shim written for exclusions alone was tried and
+// dropped: on 0.60+ it is skipped with a ~400-character "Security Warning
+// … run: sudo chown root:root" on stderr, which the engine's 500-character
+// failure excerpt shows INSTEAD of the real error (see failureDetail) — on
+// every job, where today only a job with a grant pays that. Gemini's own
+// route that does not care who owns the file is a policy file on `--policy`
+// (0.30+), which first needs engine.js to treat it as a capability flag, so
+// a build older than the option degrades instead of failing every turn.
+export function excludedToolsFor(job) {
+  return [...builtinWebTools("gemini_cli"), ...builtinPlatformTools("gemini_cli"),
+          ...hostWorkspaceToolsFor("gemini_cli", job)]
+}
+
 // Each server's entry: command and args from the shared map, plus the `env`
 // references Gemini needs because it redacts the inherited environment, plus
 // `trust` because a headless run has nobody to answer a per-call confirmation.
@@ -222,15 +381,20 @@ function geminiServersFor(job) {
 // anything — the same reasoning as Cursor's permissionsFor.
 export function systemSettingsFor(job) {
   const base = existingSystemSettings()
+  const exclude = [...new Set([...(Array.isArray(base.tools?.exclude) ? base.tools.exclude : []),
+                               ...excludedToolsFor(job)])]
   return {
     ...base,
-    mcpServers: { ...(base.mcpServers || {}), ...geminiServersFor(job) }
+    mcpServers: { ...(base.mcpServers || {}), ...geminiServersFor(job) },
+    tools: { ...(base.tools || {}), exclude }
   }
 }
 
 // Called before every spawn. Writes our shim when the job has something to
 // mount, and removes a stale one when it doesn't — a leftover file would keep
-// offering tools whose grant is gone, which is worse than no file.
+// offering tools whose grant is gone, which is worse than no file. The tool
+// exclusions ride along when it is written (excludedToolsFor says why not
+// alone).
 export function writeConfig(job, file) {
   if (Object.keys(mcpServersFor(job)).length === 0) {
     if (fs.existsSync(file)) fs.rmSync(file, { force: true })
@@ -523,6 +687,40 @@ function collapseEvents(events) {
   return { ...out, sawResult }
 }
 
+// What of a failed run's stderr is worth showing the person. Gemini CLI
+// opens stderr with advisories that are never the reason a run failed —
+// "Warning: --allowed-tools cli argument … deprecated" on every repository
+// turn (0.54.4 and 0.64.0 both print it), the same for tools.exclude,
+// "256-color support not detected", [STARTUP] timing notes, and on 0.60+
+// the ~400-character "Security Warning: Skipping system settings file …
+// run: sudo chown root:root" (see the header). The engine hands an adapter
+// the first 500 characters of stderr, and once baseArgs stopped being
+// rejected the repository turn's --allowed-tools came back with its
+// deprecation line. Measured on 0.64.0, a repository turn with the web
+// grant, refused because its folder was untrusted: the real error starts
+// at character 719, so the excerpt was the deprecation line and the
+// security warning — the person was told to hand the companion's folder
+// to root. Dropping these lines lets whatever real error fits through lead;
+// with nothing left the caller says the generic thing rather than repeating
+// the noise (that refusal now reads "Gemini exited with an error." — the
+// excerpt itself is engine.js's to widen). ANSI colour codes go too (the
+// trust error arrives wrapped in red).
+const STDERR_NOISE = [
+  /^Warning: .*\bdeprecated\b/,
+  /^Warning: 256-color support not detected/,
+  /^Security Warning: Skipping system (settings|defaults) file/,
+  /^\[STARTUP\]/
+]
+
+export function failureDetail(detail) {
+  return String(detail || "")
+    .replace(/\x1b\[[0-9;]*m/g, "")
+    .split("\n")
+    .filter((line) => !STDERR_NOISE.some((re) => re.test(line.trim())))
+    .join("\n")
+    .trim()
+}
+
 export const gemini = {
   id: "gemini_cli",
   name: "Gemini CLI",
@@ -553,10 +751,14 @@ export const gemini = {
 
   streamingArgs,
   renderPrompt,
+  // A resume whose session this machine no longer holds is retried once as
+  // an ordinary full-history turn — see fallbackJob.
+  fallbackJob,
 
-  // Writes the system-overrides shim (MCP servers) before every spawn — see
-  // the header. Runs for the ambient login too, which is why the engine calls
-  // prepare() whether or not there is a managed config directory.
+  // Writes the system-overrides shim (MCP servers, and the tool exclusions
+  // riding with them) before every spawn — see the header. Runs for the
+  // ambient login too, which is why the engine calls prepare() whether or
+  // not there is a managed config directory.
   prepare(job, { filesDir }) {
     writeConfig(job, settingsPathIn(filesDir()))
   },
@@ -576,7 +778,7 @@ export const gemini = {
   collapseEvents,
   partialTextFrom,
   classifyFailure: (detail) =>
-    classifyFailure(detail, { name: "Gemini", loginHint: "run `gemini` once to sign in" }),
+    classifyFailure(failureDetail(detail), { name: "Gemini", loginHint: "run `gemini` once to sign in" }),
 
   // What this runtime cannot do, in a form the CLI can print. Being able to
   // say "edits yes, git no" beats a user discovering it when a session
@@ -585,9 +787,14 @@ export const gemini = {
   // cma_web MCP servers now mount through the system-settings shim, so a
   // Gemini run can open pull requests and read the web — it still cannot run
   // git itself.
+  // The third line is the 0.60 settings-file check (see the header): true
+  // of every current Gemini CLI run by an ordinary account, so it is printed
+  // rather than discovered when a Gemini session cannot open a pull request.
   limitations: [
     "Repository turns can read and edit files, but cannot run git — the machine pushes for them.",
-    "One Gemini login per machine."
+    "One Gemini login per machine.",
+    "Gemini CLI 0.60 and later ignores the companion's settings file unless root owns its folder, " +
+      "so the GitHub and web tools are not mounted and Gemini keeps its own web and file tools."
   ],
 
   resolveBin() {

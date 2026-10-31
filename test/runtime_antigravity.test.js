@@ -6,6 +6,7 @@ import {
   resumeIdOf
 } from "../src/runtimes/antigravity.js"
 import { withoutCapabilityFlags } from "../src/engine.js"
+import { HOST_WORKSPACE_TOOLS } from "../src/runtimes/shared.js"
 
 // ---------------------------------------------------------------------------
 // Antigravity (`agy`), against the wire as real builds emit it.
@@ -480,4 +481,20 @@ test("the write posture is stated, not hidden", () => {
   assert.ok(antigravity.limitations.some((line) => /git/i.test(line)))
   assert.equal(antigravity.reportsModels, false, "the seed is the picker until the server prefers a reported list")
   assert.deepEqual(antigravity.extraHomePaths, [], "the installer writes ~/.local/bin/agy, which HOME_BIN_DIRS sweeps")
+})
+
+// Every other tool-carrying runtime takes its own file and shell tools off a
+// bot turn with no checkout. agy has no flag that removes a tool, so what it
+// does have is pinned: no grant of any kind, so headless mode auto-denies the
+// writes and commands, and the read tools it keeps are declared.
+test("a bot turn with no checkout keeps the chat posture, and the read-tool gap is stated", () => {
+  const bot = antigravity.streamingArgs({ text_protocol: true }, "go")
+  for (const flag of ["--mode=accept-edits", "--add-dir", "--dangerously-skip-permissions"]) {
+    assert.ok(!bot.includes(flag), `${flag} must never reach a bot turn with no checkout`)
+  }
+  assert.ok(!bot.some((arg) => /^--mode/.test(arg)), "no mode that approves anything")
+
+  assert.deepEqual(HOST_WORKSPACE_TOOLS.antigravity, [], "nothing here can take a tool off")
+  assert.ok(antigravity.limitations.some((line) => /bot turn/.test(line) && /read tools/.test(line)),
+    "the read tools a bot turn keeps must be declared")
 })

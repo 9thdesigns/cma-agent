@@ -5,6 +5,7 @@ import {
   CHAT_DISALLOWED_TOOLS, STREAM_SCHEMA, STREAM_SCHEMA_VERSION,
   additiveUsageFrom, codewhale, effortArgs, execArgs, globalArgs
 } from "../src/runtimes/codewhale.js"
+import { HOST_WORKSPACE_TOOLS } from "../src/runtimes/shared.js"
 
 // ---------------------------------------------------------------------------
 // The fixtures below are CodeWhale's own (v0.9.13): the `turn_usage` example
@@ -288,6 +289,28 @@ test("a chat turn takes the native tools off the surface; a repository turn keep
 
   const probe = codewhale.probeArgs()
   assert.equal(probe[probe.indexOf("--disallowed-tools") + 1], "read,write,edit,bash,agent")
+})
+
+// A bot turn calls the platform's tools as [[TOOL:...]] markers. A scheduled
+// bot whose CLI kept its own file and shell tools beside them spent its run
+// on the laptop's disk. CodeWhale needs no bot-specific branch — every turn
+// without a folder already loses them — and this pins that it stays so.
+test("a bot turn with no checkout gets one protocol: CodeWhale's file and shell tools are off", () => {
+  const disallowed = (args) => String(args[args.indexOf("--disallowed-tools") + 1] || "").split(",")
+
+  const bot = codewhale.streamingArgs({ ...CHAT_JOB, text_protocol: true }, "hi")
+  for (const tool of HOST_WORKSPACE_TOOLS.codewhale) {
+    assert.ok(disallowed(bot).includes(tool), `${tool} must be off a bot turn`)
+  }
+  assert.ok(!bot.includes("--auto"))
+  assert.ok(!bot.includes("--workspace"))
+
+  // The shared list is where the names live; the chat list is built from it.
+  assert.deepEqual(HOST_WORKSPACE_TOOLS.codewhale, ["read", "write", "edit", "bash"])
+  for (const tool of HOST_WORKSPACE_TOOLS.codewhale) assert.ok(CHAT_DISALLOWED_TOOLS.includes(tool))
+
+  const repo = codewhale.streamingArgs({ ...REPO_JOB, text_protocol: true }, "hi")
+  assert.ok(!repo.includes("--disallowed-tools"), "a bot turn in a checkout keeps its file tools")
 })
 
 test("app-driven runs never post telemetry on the user's behalf", () => {

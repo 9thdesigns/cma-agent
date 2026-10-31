@@ -3,8 +3,8 @@ import path from "node:path"
 
 import {
   builtinPlatformTools, builtinWebTools, classifyFailure, emptyUsage, envForGithub, envForWeb,
-  FORBIDDEN_GIT, GIT_VERBS, locateBin, locationAdvice, loginCommand,
-  mcpServersFor, normalizeUsage, occupancyOf, shortCommand, shortPath
+  FORBIDDEN_GIT, GIT_VERBS, HOST_WORKSPACE_TOOLS, locateBin, locationAdvice,
+  loginCommand, mcpServersFor, normalizeUsage, occupancyOf, shortCommand, shortPath
 } from "./shared.js"
 
 // ---------------------------------------------------------------------------
@@ -18,7 +18,7 @@ import {
 // src/app/cli.rs of the same tree (read at pager-bin 1.0.24):
 //
 //   grok -p "<prompt>" --output-format streaming-json \
-//        --model <id> [--effort <level>] [--resume <uuid>] \
+//        --model <id> [--effort <level>] [--max-turns <N>] [--resume <uuid>] \
 //        --yolo --sandbox <profile> \
 //        --allow '<rule>' --deny '<rule>' --disallowed-tools <names>
 //
@@ -31,7 +31,7 @@ import {
 //   --sandbox <profile>     off | workspace | read-only | strict | devbox
 //   --allow / --deny        permission rules, glob-matched: Bash(git push*)
 //   --tools / --disallowed-tools   allow- and deny-lists of tool NAMES
-//   --max-turns <N>         cap the agentic loop
+//   --max-turns <N>         cap the agentic loop (job.max_steps; maxTurnsFor)
 //   GROK_HOME               config directory (default ~/.grok)
 //
 // ── Why this one gets the real allowance ───────────────────────────────────
@@ -84,6 +84,8 @@ const CLI = {
   streamFormat: ["--output-format", "streaming-json"],
   model: (id) => ["--model", id],
   effort: (level) => ["--effort", level],
+  // The composer's step budget (job.max_steps) — see maxTurnsFor.
+  maxTurns: (count) => ["--max-turns", String(count)],
   // Only ever a session uuid — see resumePlan for what is kept off it.
   resume: (id) => ["--resume", id],
   sandbox: (profile) => ["--sandbox", profile],
@@ -108,6 +110,39 @@ const GIT_RULES = GIT_VERBS.map((verb) => `Bash(git ${verb}*)`)
 export const DENIED_RULES = FORBIDDEN_GIT.map((command) => `Bash(${command}*)`)
 export const DENIED_TOOLS = [...builtinWebTools("grok"), ...builtinPlatformTools("grok")]
 
+// A turn with no checkout gets NONE of the host's files or shell — a bot turn
+// and a plain chat alike. Bot turns call the platform's tools as [[TOOL:...]]
+// markers (`text_protocol`), and every chat turn here runs `--yolo` — which
+// auto-approves every call the deny list does not refuse — so before this,
+// grok's own read_file and shell ran unasked under the read-only sandbox,
+// which stops writes and not reads. That is how a scheduled bot spent its run
+// reading the laptop's disk instead of shipping anything. These are the same
+// documented prefixes FILE_RULES grants, as denies, and "deny wins over every
+// other rule" is what makes them hold under --yolo. `Bash(*)` is the git
+// rules' own glob with nothing before the star: any invocation, the way
+// `Bash(git commit*)` is any git commit.
+//
+// The condition is `!job.workdir`, NOT shared.js#hostWorkspaceOff (which also
+// asks for `text_protocol`). 0.27.1 closed the bot turn and left the plain
+// chat exactly where the bot had been: a question typed into the web app's
+// chat, on a Grok login, still ran `--sandbox read-only --yolo` with
+// read_file, grep and the shell auto-approved — so "what's in my SSH config?"
+// was a question the model could ANSWER from the paired laptop's disk, for
+// whoever was signed into that chat. A chat completion has no folder to work
+// in; the only thing those tools could ever reach is a file nobody shared.
+// A repository turn is untouched: it has a checkout, and FILE_RULES grants it.
+//
+// The names in shared.js (HOST_WORKSPACE_TOOLS.grok) also ride
+// --disallowed-tools, so the tools leave the schema rather than only failing
+// when called — a chat that is shown read_file and refused it spends its
+// steps asking again. The rules stay the enforcement either way: a renamed
+// tool slips a name list and still hits its prefix.
+export const HOST_WORKSPACE_RULES = ["Read(**)", "Grep(**)", "Edit(**)", "Write(**)", "Bash(*)"]
+
+function hostWorkspaceClosed(job) {
+  return !job?.workdir
+}
+
 // Exported so the allowance a repository turn actually runs with can be
 // asserted rather than trusted. What a run may do is a security decision and
 // must stay reachable without spawning anything.
@@ -123,15 +158,48 @@ export function permissionArgs(job) {
   if (job.web?.token) args.push(...CLI.allow("MCPTool(cma_web*)"))
 
   for (const rule of DENIED_RULES) args.push(...CLI.deny(rule))
-  if (DENIED_TOOLS.length > 0) args.push(...CLI.disallowedTools(DENIED_TOOLS))
+  if (hostWorkspaceClosed(job)) {
+    for (const rule of HOST_WORKSPACE_RULES) args.push(...CLI.deny(rule))
+  }
+
+  // One flag, one comma list: the platform's own built-ins on every job, plus
+  // the host's file and shell tools on any turn with no checkout.
+  const tools = [...DENIED_TOOLS, ...(hostWorkspaceClosed(job) ? HOST_WORKSPACE_TOOLS.grok : [])]
+  if (tools.length > 0) args.push(...CLI.disallowedTools(tools))
 
   return args
+}
+
+// The code composer's "Max steps" dial (Code::Session#max_steps), as Grok's
+// own turn ceiling — the same contract claude-code.js#maxTurnsFor keeps for
+// `claude --max-turns`, and the same bound.
+//
+// The server has shipped `max_steps` on every local run since the dial
+// existed (Ai::LocalCompanionClient, the agent jobs API allowlist), and this
+// adapter's header has listed `--max-turns` since it was written — but
+// baseArgs never emitted it, so a Grok code session set to "10 steps" ran
+// until the model was done or the companion's safety ceiling stopped it, and
+// the step limit the composer showed was a number nothing enforced. The flag
+// is in the clap definitions the header cites (src/app/cli.rs, re-read at
+// grok-build 2bdd1d6: `#[arg(long = "max-turns", value_parser = u32 range
+// 1..)]`) and the headless guide lists it as headless-only, which `-p` is.
+//
+// Unlimited (the default) sends nothing; a value is bounded and integral
+// because it lands in argv, and 1..=1000 is inside clap's u32 range.
+const MAX_TURNS_CEILING = 1000
+
+export function maxTurnsFor(job) {
+  const n = Number.parseInt(String(job?.max_steps ?? ""), 10)
+  if (!Number.isInteger(n) || n < 1) return null
+  return Math.min(n, MAX_TURNS_CEILING)
 }
 
 export function baseArgs(job) {
   const args = [...CLI.streamFormat, CLI.noAutoUpdate]
   if (job.model) args.push(...CLI.model(job.model))
   args.push(...effortArg(job))
+  const turns = maxTurnsFor(job)
+  if (turns) args.push(...CLI.maxTurns(turns))
 
   const plan = resumePlan(job)
   if (plan) args.push(...CLI.resume(plan.sessionId))
@@ -146,7 +214,9 @@ export function baseArgs(job) {
     // own tests and its git remote, and strict blocks child network.
     args.push(...CLI.sandbox("workspace"), CLI.yolo)
   } else {
-    // A chat completion writes nothing and reaches nothing.
+    // A chat completion writes nothing and reaches nothing: the sandbox stops
+    // the writes, and permissionArgs denies the reads and the shell that
+    // read-only would still let through — see HOST_WORKSPACE_RULES.
     args.push(...CLI.sandbox("read-only"), CLI.yolo)
   }
 
@@ -773,6 +843,7 @@ function collapseEvents(events) {
   let contextTokens = 0
   let spend = null
   let sessionId = null
+  let hitTurnLimit = false
   const text = []
   // The per-response lines: the fallback total, and the count of responses.
   const calls = { usage: emptyUsage(), reasoning: 0, reported: false, seen: 0 }
@@ -818,6 +889,7 @@ function collapseEvents(events) {
         break
       }
       case "max_turns_reached":
+        hitTurnLimit = true
         warn("Grok stopped at its turn limit before the task was finished.")
         break
       case "auto_compact_failed":
@@ -857,6 +929,26 @@ function collapseEvents(events) {
   // The id to hand back as `runtime_session_id` — see resumePlan for the
   // `--resume` side of the same contract.
   if (sessionId) out.usage.runtime_session_id = sessionId
+
+  // The step budget the person set, reported in the one word the server
+  // reads for it. Code::GenerateResponseJob appends its step-limit line only
+  // when finish_reason is `max_turns` — the word claude-code.js normalises
+  // `error_max_turns` to. Without this, the run --max-turns now stops would
+  // reach the person as a half-finished answer under Grok's own stop word,
+  // with no line saying the limit was hit or how to raise it.
+  //
+  // Keyed on the `max_turns_reached` line, not on `end.stopReason`. In
+  // xai-org/grok-build (crates/codegen/xai-grok-pager/src/headless.rs, read
+  // at 2bdd1d6) that line is written in exactly one place: when the prompt
+  // response carries `cancellationCategory: "max_turns_reached"` — the
+  // category xai-grok-shell stamps on a turn that ran out of --max-turns —
+  // followed by `end`, and then the process exits NON-ZERO ("max turns
+  // reached"). `end` makes sawResult true and is a spent event, so the
+  // engine neither retries (fallbackJob) nor fails the turn; the text so far
+  // is the answer. The `end` line's own stopReason for that case is whatever
+  // ACP StopReason the shell chose, which the source does not pin, so an
+  // `end` with `max_turn_requests` and no marker keeps its own word.
+  if (hitTurnLimit) out.stopReason = "max_turns"
 
   out.content = text.join("")
   return { ...out, sawResult }

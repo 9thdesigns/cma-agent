@@ -100,6 +100,25 @@ export function removeRoot(input) {
   return resolved
 }
 
+// A managed workspace was just used — say so, by bumping its directory's
+// mtime. That timestamp is the whole bookkeeping behind src/tidy.js: no
+// marker file inside the tree (push's `git add -A` would sweep one into a
+// pull request), no registry to fall out of step — the directory's own mtime
+// says when this machine last worked in it. Bumped on the TOP-LEVEL entry
+// under WORKSPACES_DIR, because that is the unit tidying removes, and a path
+// deep inside a working tree must keep the whole tree alive.
+export function markWorkspaceUsed(target) {
+  try {
+    const root = fs.realpathSync(WORKSPACES_DIR)
+    const rel = path.relative(root, fs.realpathSync(target))
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return
+    const now = new Date()
+    fs.utimesSync(path.join(root, rel.split(path.sep)[0]), now, now)
+  } catch {
+    // Best-effort, always: housekeeping must never cost a run.
+  }
+}
+
 // True only when `target` is an allowlisted root or genuinely inside one.
 // `path.relative` is what makes this safe against `..`: an escaping path
 // produces a relative that starts with "..", and an absolute one on a
@@ -154,6 +173,9 @@ export function resolveRepo(requested) {
   if (!fs.existsSync(path.join(real, ".git"))) {
     throw new Error(`${target} isn't a git repository.`)
   }
+  // Every job that lands in a managed checkout passes through here, so this
+  // is where "in use" is recorded — see markWorkspaceUsed and src/tidy.js.
+  if (managed) markWorkspaceUsed(real)
   return real
 }
 
@@ -598,11 +620,15 @@ export async function branchDelete(params) {
 // the same ref lock. The sessions themselves stay parallel; only the moment
 // that touches the shared clone is single-file.
 //
-// In-process and per-slug. It does not need to survive a restart: nothing is
-// half-written that the next `ensure` cannot repair.
+// In-process and per-repository. It does not need to survive a restart:
+// nothing is half-written that the next `ensure` cannot repair.
+//
+// Exported, and keyed by the clone's DIRECTORY name rather than the slug, so
+// the tidy pass (src/tidy.js) queues behind a `repo.ensure` touching the same
+// clone instead of removing a working tree out from under it.
 const repoLocks = new Map()
 
-function withRepoLock(key, work) {
+export function withRepoLock(key, work) {
   const queue = (repoLocks.get(key) || Promise.resolve()).then(work, work)
   // Stored swallowing failures: this chain is only for ordering, and a
   // rejection here must not become an unhandled one or poison the next caller.
@@ -613,14 +639,22 @@ function withRepoLock(key, work) {
 export function ensureCheckout(params) {
   // Sanitised before the lock so a bad slug fails the same way it always has,
   // rather than queueing behind real work first.
-  return withRepoLock(sanitizeSlug(params.github), () => prepareCheckout(params))
+  return withRepoLock(cloneDirName(sanitizeSlug(params.github)), () => prepareCheckout(params))
+}
+
+// The directory one repository's shared clone lives in. A session's working
+// tree hangs off it as `<dir>@<workspace>`, which is why nothing else in a
+// name may contain "@" — sanitizeSlug and sanitizeWorkspace both forbid it,
+// and src/tidy.js tells the two apart by exactly that character.
+function cloneDirName(slug) {
+  return slug.replace("/", "__")
 }
 
 async function prepareCheckout(params) {
   const slug = sanitizeSlug(params.github)
   const branch = params.branch ? sanitizeBranch(params.branch) : null
   const workspace = params.workspace ? sanitizeWorkspace(params.workspace) : null
-  const dir = path.join(WORKSPACES_DIR, slug.replace("/", "__"))
+  const dir = path.join(WORKSPACES_DIR, cloneDirName(slug))
 
   fs.mkdirSync(WORKSPACES_DIR, { recursive: true, mode: 0o700 })
 
@@ -665,6 +699,10 @@ async function prepareCheckout(params) {
     // working tree, and saying so beats refusing to run at all.
   }
 
+  // The clone was just used on this session's behalf, worktree or not — the
+  // mtime is what keeps the tidy pass's hands off it. See markWorkspaceUsed.
+  markWorkspaceUsed(dir)
+
   // A session that named itself gets its own working tree off this clone.
   //
   // Without it, two sessions on one repository shared a directory: the second
@@ -679,6 +717,7 @@ async function prepareCheckout(params) {
   if (workspace) {
     const isolated = await addWorktree(dir, slug, workspace, branch)
     if (isolated) {
+      markWorkspaceUsed(isolated)
       await writeSkills(isolated, params.skills)
       return { ...(await describe(isolated)), created: fresh, managed: true, isolated: true }
     }
@@ -838,7 +877,7 @@ async function excludeSkillPaths(dir, slugs) {
 // Returns the directory, or null when this git can't do it — every caller
 // treats null as "carry on with the shared clone".
 async function addWorktree(cacheDir, slug, workspace, branch) {
-  const dir = path.join(WORKSPACES_DIR, `${slug.replace("/", "__")}@${workspace}`)
+  const dir = path.join(WORKSPACES_DIR, `${cloneDirName(slug)}@${workspace}`)
 
   // Clears administrative entries for worktrees whose directories are gone
   // (someone tidied ~/.configure-my-ai by hand). Without it git refuses to
@@ -934,6 +973,10 @@ function ensureScratchWorkspace(params) {
 
   const dir = path.join(WORKSPACES_DIR, `${SCRATCH_PREFIX}${key}`)
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  // Writing INTO a directory does not touch its own mtime, and the server
+  // asks for this workspace on every turn — so this is the "still in use"
+  // signal the tidy pass reads. See markWorkspaceUsed.
+  markWorkspaceUsed(dir)
   const seeded = seedFiles(dir, params.files)
   return { path: dir, seeded }
 }

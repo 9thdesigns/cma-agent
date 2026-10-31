@@ -15,7 +15,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 
-import { contextWindowFor, gemini, resumeIdOf, streamingArgs } from "../src/runtimes/gemini.js"
+import { baseArgs, contextWindowFor, excludedToolsFor, gemini, resumeIdOf, streamingArgs } from "../src/runtimes/gemini.js"
 
 const SESSION = "3f2b9c1e-7d4a-4b6e-9a1c-5e8f2d3c4b6a"
 
@@ -191,12 +191,17 @@ test("an unrecognised stats shape yields the empty usage, and a missing result s
 // ---------------------------------------------------------------------------
 
 test("a previous run's session id becomes --resume", () => {
-  const args = streamingArgs({ model: "gemini-3.1-pro-preview", runtime_session_id: SESSION }, "next step")
+  // A continuation: the session holds the first exchange, the tail is new.
+  const messages = [{ role: "user", content: "first" }, { role: "assistant", content: "done" },
+                    { role: "user", content: "next step" }]
+  const args = streamingArgs({ model: "gemini-3.1-pro-preview", runtime_session_id: SESSION, messages }, "next step")
   const at = args.indexOf("--resume")
   assert.ok(at > -1)
   assert.equal(args[at + 1], SESSION)
-  assert.equal(args[0], "--prompt", "the prompt stays the first argument")
-  assert.equal(args[1], "next step")
+  // One `--prompt=` token: a resumed prompt is the user's own words, and one
+  // that starts with "-" must not be read as the next flag (gemini.js CLI.prompt).
+  assert.equal(args[0], "--prompt=next step", "the prompt stays the first argument")
+  assert.equal(streamingArgs({}, "- fix the login")[0], "--prompt=- fix the login")
 })
 
 test("no session id, no --resume — and the camelCase spelling is read too", () => {
@@ -226,4 +231,16 @@ test("the CLI's token limit table: 1,048,576 for Gemini ids, 256,000 for Gemma 4
   assert.equal(contextWindowFor("gemma-4-26b-a4b-it"), 256_000)
   assert.equal(contextWindowFor(""), null)
   assert.equal(contextWindowFor(null), null)
+})
+
+test("a bot turn with no checkout excludes Gemini's own file and shell tools", () => {
+  // In the settings shim's tools.exclude — never on argv: Gemini CLI's main
+  // command has no --exclude-tools, and sending it failed every turn.
+  const excluded = excludedToolsFor
+
+  assert.ok(excluded({ text_protocol: true }).includes("run_shell_command"))
+  assert.ok(excluded({ text_protocol: true }).includes("read_file"))
+  assert.ok(!excluded({}).includes("read_file"))
+  assert.ok(!excluded({ text_protocol: true, workdir: "/tmp/repo" }).includes("read_file"))
+  assert.ok(!baseArgs({ text_protocol: true }).includes("--exclude-tools"))
 })
